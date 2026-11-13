@@ -1,0 +1,19 @@
+--- a/src/unae/store.py
++++ b/src/unae/store.py
+@@ -374,6 +374,16 @@
+                 c.execute("ROLLBACK")
+                 raise
+ 
++    def get_operation(self, operation_id: str) -> dict[str, Any] | None:
++        """Lectura pública (solo lectura) de una operación del diario de ejecución; None si no existe.
++        No modifica nada. Devuelve una copia: cambiarla no afecta al Store."""
++        if not isinstance(operation_id, str):
++            raise TypeError("operation_id debe ser str")
++        with closing(self.connect()) as c:
++            row = c.execute("SELECT operation_id,task_id,reservation_id,idempotency_key,status,fencing_token,provider_operation_id,recovery_count "
++                            "FROM execution_journal WHERE operation_id=?", (operation_id,)).fetchone()
++        return dict(row) if row else None
++
+     def list_overruns(self, operation_id: str | None = None) -> list[dict[str, Any]]:
+         """Sobreconsumos registrados al confirmar (consumo real mayor que lo reservado)."""
+         q = "SELECT operation_id,compute_overrun,time_overrun_ms,memory_overrun_bytes,created_at FROM resource_overruns"

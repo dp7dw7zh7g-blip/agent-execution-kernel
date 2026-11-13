@@ -1,0 +1,68 @@
+--- a/src/dtos/schema.sql
++++ b/src/dtos/schema.sql
+@@ -450,6 +450,12 @@
+     recorded_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+ );
+ 
++-- D-70 (parche 0018): índice PARCIAL de la cola. `get_pending_outbox` filtra `published = 0` y ordena por `outbox_id`; sin este índice recorría
++-- TODA la tabla (con 200 000 eventos ya publicados: 7,8 ms por consulta frente a 0,01 ms) y el coste crecía sin tope porque el outbox no se
++-- purgaba. Al ser parcial solo indexa los pendientes (la cola real), así que no engorda con el histórico. IF NOT EXISTS: las bases existentes
++-- lo reciben al abrirse.
++CREATE INDEX IF NOT EXISTS ix_outbox_pending ON outbox (outbox_id) WHERE published = 0;
++
+ -- D-65 (parche 0014): fallos de publicación y cuarentena (dead-letter) del outbox. Un evento que no se puede publicar nunca
+ -- (payload no JSON) o que agotó sus intentos pasa a quarantined = 1 y deja de ocupar la cabeza de la cola; la fila de `outbox`
+ -- no se toca (el hecho sigue ahí para la revisión manual). No hay clave foránea: la cuarentena no debe bloquear nada.
+--- a/src/dtos/store.py
++++ b/src/dtos/store.py
+@@ -602,6 +602,34 @@
+             "AND outbox_id NOT IN (SELECT outbox_id FROM outbox_failures WHERE quarantined = 1) ORDER BY outbox_id ASC LIMIT ?", (limit,)).fetchall()]
+ 
+     # -----------------------------------------------------------------
++    # OUTBOX: retención del histórico publicado (D-70, parche 0018)
++    # -----------------------------------------------------------------
++
++    PURGE_MAX_LIMIT = 100_000
++
++    def purge_published_outbox(self, *, older_than_days: float, limit: int = 1000) -> int:
++        """D-70: borra del outbox eventos YA PUBLICADOS (`published = 1`) con más de `older_than_days` días, como máximo `limit` por llamada, los más
++        antiguos primero. Devuelve cuántos borró; para vaciar un histórico grande se llama en bucle hasta que devuelva 0 (cada llamada es una
++        transacción corta: no retiene el bloqueo de escritura más que `limit` filas). Nunca toca: un evento pendiente o en cuarentena, ni uno con
++        historial en `outbox_requeues` (esa bitácora es append-only y debe seguir apuntando a un evento que existe). Borra también la fila de
++        `outbox_failures` del evento purgado (fallos transitorios previos a su publicación). Los `outbox_id` no se reutilizan (AUTOINCREMENT).
++        No se llama sola: la retención la decide quien opera el kernel. NO deja constancia en `audit_log`; el outbox es una cola de entrega, no el
++        libro de hechos. `older_than_days` debe ser un número finito > 0 (no bool) y `limit` un entero entre 1 y `PURGE_MAX_LIMIT`."""
++        if isinstance(older_than_days, bool) or not isinstance(older_than_days, (int, float)) or not (0 < older_than_days < 36500):
++            raise ValueError(f"older_than_days: debe ser un número en (0, 36500) días, recibido {older_than_days!r}")
++        if isinstance(limit, bool) or not isinstance(limit, int) or not (1 <= limit <= self.PURGE_MAX_LIMIT):
++            raise ValueError(f"limit: debe ser un entero entre 1 y {self.PURGE_MAX_LIMIT}, recibido {limit!r}")
++        modifier = f"-{older_than_days:.6f} days"  # nunca notación exponencial: SQLite no la acepta en el modificador
++        with self.transaction() as conn:
++            ids = [row[0] for row in conn.execute(
++                "SELECT o.outbox_id FROM outbox o WHERE o.published = 1 AND o.recorded_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?) "
++                "AND NOT EXISTS (SELECT 1 FROM outbox_requeues r WHERE r.outbox_id = o.outbox_id) ORDER BY o.outbox_id ASC LIMIT ?",
++                (modifier, limit)).fetchall()]
++            conn.executemany("DELETE FROM outbox_failures WHERE outbox_id = ?", [(i,) for i in ids])
++            conn.executemany("DELETE FROM outbox WHERE outbox_id = ? AND published = 1", [(i,) for i in ids])
++        return len(ids)
++
++    # -----------------------------------------------------------------
+     # OUTBOX: cuarentena y lease del publicador (D-65, parche 0014)
+     # -----------------------------------------------------------------
+ 
+--- a/src/unae/store.py
++++ b/src/unae/store.py
+@@ -194,7 +194,12 @@
+ 
+     def _initialize(self) -> None:
+         with closing(self.connect()) as c:
+-            c.execute("PRAGMA journal_mode=WAL")
++            mode = str(c.execute("PRAGMA journal_mode=WAL").fetchone()[0]).lower()
++            if mode != "wal":  # D-70: igual que DTOS (D-57); antes se degradaba en silencio a otro modo
++                raise RuntimeError(
++                    f"journal_mode: se pidió WAL y SQLite devolvió {mode!r} para {self.path!r} (¿sistema de archivos de red, sin soporte de memoria "
++                    f"compartida o base en memoria?). UNAE exige WAL: sus operaciones abren una conexión por llamada y dependen de que lectores y "
++                    f"escritor no se bloqueen.")
+             c.executescript("""
+             CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
+             INSERT INTO schema_version(version) SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM schema_version);

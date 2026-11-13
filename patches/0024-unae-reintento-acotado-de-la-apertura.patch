@@ -1,0 +1,81 @@
+--- a/src/unae/store.py
++++ b/src/unae/store.py
+@@ -4,6 +4,7 @@
+ import hmac
+ from contextlib import closing
+ import json
++import random
+ import sqlite3
+ import time
+ import uuid
+@@ -150,6 +151,25 @@
+     return busy, limit
+ 
+ 
++# D-76 (parche 0024 / g0.8 r31): reintento acotado de la APERTURA, MISMA estrategia que DTOS (D-67) pero con código propio (D-63). SQLite puede devolver «database is locked» SIN esperar el
++# busy_timeout cuando esperar podría causar un bloqueo mutuo (lo documenta SQLite); con varios procesos abriendo a la vez una base nueva (cambio a WAL + esquema) uno puede fallar.
++# Se repite TODA la apertura (es idempotente: IF NOT EXISTS y migraciones atómicas) con pausas crecientes y jitter, hasta agotar `busy_timeout_ms` contado desde el inicio.
++# Con `busy_timeout_ms=0` no se reintenta. Valores de política, no salen de mediciones.
++OPEN_RETRY_FIRST_S = 0.01
++OPEN_RETRY_MAX_S = 0.25
++
++
++def _is_lock_error(exc: BaseException) -> bool:
++    """True si `exc` es un bloqueo temporal de SQLite (SQLITE_BUSY o SQLITE_LOCKED, con o sin código extendido). Sin código (Python < 3.11 o errores
++    construidos a mano) se decide por el texto."""
++    if not isinstance(exc, sqlite3.OperationalError):
++        return False
++    code = getattr(exc, "sqlite_errorcode", None)
++    if isinstance(code, int):
++        return (code & 0xFF) in (5, 6)
++    return "locked" in str(exc).lower()
++
++
+ class Store:
+     """Single-file SQLite reference store. External calls must never run inside its transactions."""
+ 
+@@ -165,7 +185,8 @@
+         para liberarla; no usar el Store a través de fork().
+         fault_hook: solo para pruebas de caída. Se invoca como hook("<método>:before_commit") y hook("<método>:after_commit").
+         busy_timeout_ms / journal_size_limit_bytes (D-74, solo por nombre): espera ante un bloqueo (10000 ms por defecto; 0 a 2147483647, D-75) y recorte del -wal tras un checkpoint
+-        completo (64 MiB por defecto; -1 sin límite). Se validan antes de abrir nada y se verifican leyéndolos de vuelta al abrir."""
++        completo (64 MiB por defecto; -1 sin límite). Se validan antes de abrir nada y se verifican leyéndolos de vuelta al abrir.
++        La apertura se reintenta ante un bloqueo temporal hasta agotar busy_timeout_ms en total (D-76; con 0 no se reintenta)."""
+         busy_timeout_ms, journal_size_limit_bytes = _validate_connection_policy(busy_timeout_ms, journal_size_limit_bytes)  # D-75: valores normalizados
+         self.path = str(path)
+         self.busy_timeout_ms = busy_timeout_ms
+@@ -177,7 +198,7 @@
+             raise ValueError("synchronous must be 'FULL' or 'NORMAL'")
+         self._synchronous = synchronous
+         self._finalizer = None
+-        self._initialize()
++        self._open_with_retry()
+         if keep_open:
+             anchor = sqlite3.connect(self.path, timeout=self.busy_timeout_ms / 1000, isolation_level=None, check_same_thread=False)
+             anchor.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
+@@ -222,6 +243,25 @@
+         conn.execute(f"PRAGMA synchronous={self._synchronous}")
+         return conn
+ 
++    def _open_with_retry(self) -> None:
++        """D-76: ejecuta `_initialize` y, ante un bloqueo temporal, repite TODO el paso con pausas crecientes y jitter hasta agotar `busy_timeout_ms` desde el
++        inicio; pasado el plazo relanza el error original. Los errores que no son de bloqueo (y el RuntimeError de WAL) no se reintentan. Cada intento abre
++        y cierra sus propias conexiones, así que un fallo a medias no deja transacciones abiertas."""
++        deadline = time.monotonic() + self.busy_timeout_ms / 1000
++        delay = OPEN_RETRY_FIRST_S
++        while True:
++            try:
++                self._initialize()
++                return
++            except sqlite3.OperationalError as exc:
++                if not _is_lock_error(exc):
++                    raise
++                remaining = deadline - time.monotonic()
++                if remaining <= 0:
++                    raise
++                time.sleep(min(delay * (0.5 + random.random() / 2), remaining))
++                delay = min(delay * 2, OPEN_RETRY_MAX_S)
++
+     def _initialize(self) -> None:
+         with closing(self.connect()) as c:
+             mode = str(c.execute("PRAGMA journal_mode=WAL").fetchone()[0]).lower()

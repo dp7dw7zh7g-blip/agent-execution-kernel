@@ -1,0 +1,187 @@
+Auditoría del Contrato de Interoperabilidad UNAE–DTOS v1.0
+
+Fecha: 2026-10-23
+
+Objeto: contrastar el contrato de diseño v1.0 con los paquetes originales disponibles de UNAE 4.3S rev2, UNAE 4.3S rev3 y DTOS completo.
+
+Resultado global:** **APROBADO CON OBSERVACIONES; NO CERRADO PARA IMPLEMENTACIÓN.
+
+Integridad: esta auditoría no modifica los paquetes originales.
+
+# 1. Alcance y evidencia examinada
+
+Se inspeccionaron los siguientes archivos:
+
+`UNAE_4_3S_paridad_fsm_rev3.zip`, incluyendo `unae/fsm.json`, `unae/store.py` y la suite `tests/`.
+
+`dtos_paquete_completo.zip`, incluyendo FSM, enums, DTOs, repositorios, store, inbox/outbox y pruebas.
+
+`unae_4_3S_rev2.zip`, conservado como referencia original.
+
+`Contrato_Interoperabilidad_UNAE_DTOS_v1.0.docx`, el documento objeto de la auditoría.
+
+La revisión de rev2 fue de identificación y preservación; el contraste funcional se centró en rev3 y DTOS, que son los extremos indicados por el contrato.
+
+# 2. Resultado de las pruebas ejecutadas
+
+## DTOS
+
+Se ejecutaron los siete módulos de pruebas incluidos en el paquete:
+
+`dtos.test_fsm`
+
+`dtos.test_contracts`
+
+`dtos.test_audit`
+
+`dtos.test_effect_recovery_authority_repository`
+
+`dtos.test_inbox_outbox`
+
+`dtos.test_repository`
+
+`dtos.test_store`
+
+Resultado observado: los siete módulos terminaron con éxito y reportaron sus comprobaciones como aprobadas.
+
+## UNAE 4.3S rev3
+
+Se ejecutó python -m unittest discover -s tests -v.
+
+Las primeras pruebas de concurrencia y el escenario de caída limpia pasaron. La ejecución alcanzó test_sigkill_at_every_injection_point, pero el proceso superó el límite de tiempo de 120 segundos y fue interrumpido.
+
+Resultado observado: suite incompleta por timeout; no equivale a una suite aprobada ni demuestra por sí solo un fallo funcional. Debe repetirse en un entorno con tiempo suficiente o aislarse el test de inyección de fallos.
+
+## Integración UNAE–DTOS
+
+No se encontró un adaptador de integración entre ambos paquetes ni un esquema compartido formal de mensajes. Por lo tanto, no se ejecutaron pruebas de integración. Las pruebas unitarias de ambos proyectos no prueban la integración entre ellos.
+
+# 3. Hallazgos
+
+## H-01 — Bloqueante para declarar el contrato implementado: falta el adaptador y el esquema formal
+
+Evidencia: el contrato reconoce que el JSON mostrado es lógico/orientativo y que el JSON Schema, el transporte y el adaptador están pendientes. En los paquetes examinados no se identificó un componente que implemente el sobre de mensaje UNAE–DTOS compartido.
+
+Impacto: campos como contract_version, message_id, correlation_id, evidence_refs y message_type son por ahora decisiones propuestas, no un protocolo ya interoperable.
+
+Acción: definir y versionar un JSON Schema real, reglas de validación por message_type, política de mensajes incompatibles y transporte. Después implementar el adaptador y pruebas de extremo a extremo.
+
+Severidad: bloqueante para integración; no bloquea aprobar los principios de diseño.
+
+## H-02 — Alto: tipo de `fencing_token` no normalizado
+
+Evidencia: EffectIntent.fencing_token en DTOS es Optional[str]. UNAE usa tokens de fencing enteros (int) en operaciones como acquire_authority, reserve_and_register, mark_running, begin_reconciliation y coordinated_commit.
+
+Impacto: el contrato no fija cómo convertir, validar ni rechazar un token entre los dos modelos. Una conversión implícita podría invalidar la comparación de autoridad.
+
+Acción: definir un tipo canónico en el mensaje. Para la implementación actual de UNAE, el adaptador debe validar un entero no negativo y no aceptar coerciones ambiguas. Si se desea un token opaco en el protocolo, debe existir un campo separado y una correspondencia explícita al token entero de UNAE.
+
+## H-03 — Alto: el vínculo operación–intento no queda persistido de forma uniforme en DTOS
+
+Evidencia: EffectIntent contiene operation_id; sin embargo, la tabla effect_attempts y SQLiteStore.create_effect_attempt() persisten attempt_id, intent_id, provider, idempotency_key, status y version, sin un campo operation_id. EffectRepository.reconcile() recibe operation_id por separado y lo usa al escribir el ledger final.
+
+Impacto: la relación entre intento, intención y operación depende de que el llamador suministre correctamente la correlación. No está garantizada por la fila del intento por sí sola.
+
+Acción: el adaptador debe recuperar y verificar operation_id desde la intención persistida o desde un registro de correlación durable. Rechazar discrepancias; no confiar ciegamente en el operation_id aportado al reconciliar. Cualquier cambio de esquema DTOS debe hacerse en una versión nueva, nunca sobre el original respaldado.
+
+## H-04 — Alto: discrepancia entre “siempre entrar en RECONCILING” y la API real de UNAE
+
+Evidencia: el contrato §5.3 prescribe UNKNOWN → RECONCILING como paso de reconciliación. La FSM canónica permite también UNKNOWN → SUCCEEDED y UNKNOWN → FAILED. Además, Store.record_receipt() acepta operaciones en RUNNING, UNKNOWN o RECONCILING y, tras validar el recibo, cambia el estado a SUCCEEDED o FAILED. begin_reconciliation() implementa la ruta explícita UNKNOWN → RECONCILING.
+
+Impacto: la prosa del contrato parece exigir una única ruta, mientras que la API implementada permite que un recibo válido resuelva una operación desde UNKNOWN sin una llamada previa a begin_reconciliation().
+
+Acción requerida de diseño: escoger una de estas políticas antes de implementar:
+
+**Política estricta:** exigir `begin_reconciliation()` antes de aceptar el recibo para operaciones en `UNKNOWN`; esto requeriría cambiar o envolver la API de UNAE.
+
+**Política compatible:** permitir que un recibo verificable y ligado a la operación resuelva directamente `UNKNOWN` mediante `record_receipt()`, manteniendo la ruta `RECONCILING` para investigaciones que necesiten consulta adicional.
+
+Recomendación de auditoría: adoptar la política compatible con la API actual, siempre que la evidencia sea validada y el commit posterior pase las comprobaciones de autoridad, reserva, recibo y versión. Documentar esta excepción explícitamente.
+
+## H-05 — Medio/alto: el significado de `RECONCILED` necesita una advertencia más visible
+
+Evidencia: Store.list_unverified_settlements() declara expresamente que RECONCILED significa liquidación en el libro y estado confirmado a partir de un recibo, pero no prueba por sí solo que el efecto externo terminó bien. La misma función identifica recibos sin firma de proveedor y operaciones que pasaron por UNKNOWN.
+
+Impacto: la redacción actual puede leerse como una garantía global del resultado externo.
+
+Acción: añadir una frase normativa: RECONCILED confirma el cierre transaccional local conforme a UNAE; no certifica por sí solo la verdad del proveedor ni que el efecto externo se completara correctamente. La autenticidad depende de la política de recibos firmados y de la evidencia asociada.
+
+## H-06 — Medio/alto: la deduplicación de mensajería entre sistemas aún no está definida
+
+Evidencia: DTOS InboxProcessor deduplica por el dedup_key que entrega el llamador. Su OutboxPublisher ofrece entrega *at-least-once*, con una ventana en la que un crash puede producir redelivery. UNAE tiene su propia deduplicación para eventos/consumidores y su reserva usa idempotency_key y huella de solicitud.
+
+Impacto: el principio del contrato “mensajes duplicados no duplican operaciones o efectos” no queda garantizado solo por la existencia de las dos implementaciones locales. Falta definir qué campo se mapea a dedup_key, cómo se construye message_id y cómo se distinguen la clave del mensaje, la clave de operación y la clave de idempotencia del efecto.
+
+Acción: especificar:
+
+`message_id`: identidad única e inmutable del mensaje;
+
+`dedup_key`: identidad de entrega/consumo, estable durante redeliveries;
+
+`operation_id`: identidad de operación UNAE;
+
+`idempotency_key`: identidad de la intención lógica del efecto ante el proveedor.
+
+No reutilizar un mismo identificador para representar estas cuatro funciones.
+
+## H-07 — Medio: el documento contiene una inconsistencia editorial de numeración
+
+Evidencia: la sección 11 incluye una lista donde el punto “10. Una caída…” aparece después de los puntos sin numeración explícita y repite el número 10 dentro de la sección.
+
+Impacto: no afecta la lógica, pero dificulta citar requisitos de aceptación sin ambigüedad.
+
+Acción: renumerar de forma consecutiva las pruebas de aceptación y asignar IDs estables (por ejemplo, AT-01 a AT-14).
+
+# 4. Reglas que sí están respaldadas por el código
+
+**FSM separadas:** DTOS implementa `CognitiveCycleFSM`, `EffectFSM`, `RecoveryTriggerFSM` y `BootstrapFSM`; UNAE tiene su propia FSM canónica en `unae/fsm.json`.
+
+**Ciclo cognitivo no equivale a éxito externo:** `ReasoningResult` aclara que `COMPLETED` es el estado declarado del proveedor y no demuestra que la respuesta sea correcta; el ciclo cognitivo tiene su propia FSM.
+
+**UNKNOWN de efecto requiere reconciliación:** `EffectFSM.mark_unknown()` avanza a `RECONCILIATION_REQUIRED`; `reconcile()` exige estrategia reconocida y evidencia no vacía.
+
+**NOT_FOUND no se convierte automáticamente en rechazo:** el código de `EffectFSM` obliga a que la resolución se exprese de forma explícita y con evidencia.
+
+**Protecciones de recuperación/bootstrap:** `RecoveryTriggerFSM.declare_failure()` exige `declared_by` y evidencia no vacíos, aunque la FSM no verifica por sí sola la vigencia de la autoridad. `BootstrapFSM` no permite salidas normales desde `BOOTSTRAP_CONFLICT` ni `BOOTSTRAP_INCOMPLETE`.
+
+**Fencing en UNAE:** UNAE compara el token con la autoridad vigente en los límites de reserva, ejecución, reconciliación y commit.
+
+**Entrega de DTOS es al menos una vez, no exactamente una vez global:** el propio código de inbox/outbox documenta la ventana de redelivery y depende de la deduplicación del consumidor.
+
+# 5. Decisión recomendada sobre el estado del contrato
+
+El contrato v1.0 está bien orientado en sus principios de seguridad, pero no debe declararse cerrado para implementación hasta resolver H-02, H-03, H-04 y H-06 y corregir la numeración de las pruebas.
+
+Estado recomendado:
+
+**Principios arquitectónicos:** aceptables.
+
+**Contrato lógico:** aprobado con observaciones.
+
+**Esquema de mensajes:** pendiente.
+
+**Adaptador:** no encontrado/no implementado.
+
+**Pruebas unitarias DTOS:** siete módulos ejecutados con éxito.
+
+**Pruebas completas UNAE rev3:** inconclusas por timeout.
+
+**Pruebas de integración:** no ejecutadas; todavía no existe adaptador compartido.
+
+# 6. Orden de cierre propuesto
+
+Resolver por escrito el comportamiento de `UNKNOWN` en UNAE (H-04).
+
+Fijar el tipo y las reglas de validación del fencing token (H-02).
+
+Definir la fuente durable de la correlación `operation_id`–`effect_intent_id`–`effect_attempt_id` (H-03).
+
+Formalizar deduplicación e idempotencia entre los dos inbox/outbox (H-06).
+
+Publicar un JSON Schema versionado y corregir los IDs de pruebas.
+
+Implementar el adaptador en una versión nueva, sin modificar UNAE rev2, UNAE rev3 ni DTOS original.
+
+Ejecutar pruebas de integración y repetir la suite de UNAE en un entorno con tiempo suficiente.
+
+Conclusión: no se encontraron razones para fusionar las FSM. La dirección arquitectónica de v1.0 es sólida, pero hay decisiones de protocolo y discrepancias concretas con las APIs actuales que deben resolverse antes de convertir el documento en contrato de implementación.

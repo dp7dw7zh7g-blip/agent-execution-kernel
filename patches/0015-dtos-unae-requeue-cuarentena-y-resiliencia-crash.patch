@@ -1,0 +1,145 @@
+--- a/src/dtos/schema.sql
++++ b/src/dtos/schema.sql
+@@ -469,6 +469,23 @@
+     expires_at         REAL NOT NULL
+ );
+ 
++-- D-66 (parche 0015): bitácora APPEND-ONLY de los reencolados de eventos en cuarentena (`SQLiteStore.requeue_quarantined`). Una cuarentena por
++-- un fallo transitorio (p. ej. una caída larga del destino) debe poder revertirse sin editar SQL a mano, y cada reversión deja rastro: quién,
++-- por qué y qué contador/error tenía el evento. Sin clave foránea (como outbox_failures) y sin UPDATE ni DELETE (triggers).
++CREATE TABLE IF NOT EXISTS outbox_requeues (
++    requeue_id        INTEGER PRIMARY KEY AUTOINCREMENT,
++    outbox_id          INTEGER NOT NULL,
++    requeued_by         TEXT NOT NULL CHECK (length(trim(requeued_by)) > 0),
++    reason               TEXT NOT NULL CHECK (length(trim(reason)) > 0),
++    previous_attempts     INTEGER NOT NULL,
++    previous_error         TEXT NOT NULL,
++    requeued_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
++);
++CREATE TRIGGER IF NOT EXISTS trg_outbox_requeues_no_update BEFORE UPDATE ON outbox_requeues
++BEGIN SELECT RAISE(ABORT, 'outbox_requeues es append-only (D-66): no se actualiza'); END;
++CREATE TRIGGER IF NOT EXISTS trg_outbox_requeues_no_delete BEFORE DELETE ON outbox_requeues
++BEGIN SELECT RAISE(ABORT, 'outbox_requeues es append-only (D-66): no se borra'); END;
++
+ CREATE TABLE IF NOT EXISTS inbox (
+     dedup_key        TEXT PRIMARY KEY,     -- idempotency/dedup identity
+     event_type        TEXT NOT NULL,
+--- a/src/dtos/store.py
++++ b/src/dtos/store.py
+@@ -587,6 +587,42 @@
+             "SELECT o.outbox_id, o.event_type, f.attempts, f.last_error FROM outbox_failures f JOIN outbox o ON o.outbox_id = f.outbox_id "
+             "WHERE f.quarantined = 1 AND o.published = 0 ORDER BY o.outbox_id ASC LIMIT ?", (limit,)).fetchall()]
+ 
++    def requeue_quarantined(self, outbox_id: int, *, requeued_by: str, reason: str) -> bool:
++        """D-66: devuelve a la cola un evento en cuarentena (p. ej. tras una caída larga del destino) y deja constancia en `outbox_requeues`.
++        En UNA transacción: anota (outbox_id, requeued_by, reason, intentos y último error previos) y borra su fila de `outbox_failures`, de modo que
++        el contador vuelve a cero y `get_pending_outbox` lo devuelve de nuevo. La fila de `outbox` no se toca. True si lo reencoló; False (sin
++        efecto) si el evento no está en cuarentena, no existe o ya se publicó. Un payload que no es JSON volverá a cuarentena en la siguiente
++        corrida (reintentar no lo arregla): reencolarlo no lo corrige. `requeued_by` y `reason` son obligatorios (texto no vacío; `reason` se
++        recorta a 500 caracteres). No hay versión masiva a propósito: se itera sobre `get_quarantined_outbox()` y cada reencolado queda anotado."""
++        if isinstance(outbox_id, bool) or not isinstance(outbox_id, int):
++            raise ValueError(f"outbox_id: debe ser un entero, recibido {outbox_id!r}")
++        for name, value in (("requeued_by", requeued_by), ("reason", reason)):
++            if not isinstance(value, str) or not value.strip():
++                raise ValueError(f"{name}: texto no vacío")
++        with self.transaction() as conn:
++            row = conn.execute(
++                "SELECT f.attempts, f.last_error FROM outbox_failures f JOIN outbox o ON o.outbox_id = f.outbox_id "
++                "WHERE f.outbox_id = ? AND f.quarantined = 1 AND o.published = 0", (outbox_id,)).fetchone()
++            if row is None:
++                return False
++            conn.execute(
++                "INSERT INTO outbox_requeues (outbox_id, requeued_by, reason, previous_attempts, previous_error) VALUES (?, ?, ?, ?, ?)",
++                (outbox_id, requeued_by.strip(), reason.strip()[:500], row[0], row[1]))
++            conn.execute("DELETE FROM outbox_failures WHERE outbox_id = ?", (outbox_id,))
++        return True
++
++    def get_outbox_requeues(self, outbox_id: Optional[int] = None, limit: int = 100) -> list[tuple]:
++        """Lectura pública (solo lectura) de la bitácora de reencolados (D-66): tuplas (requeue_id, outbox_id, requeued_by, reason,
++        previous_attempts, previous_error, requeued_at) en orden de `requeue_id`; con `outbox_id`, solo las de ese evento."""
++        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
++            raise ValueError(f"limit: debe ser un entero >= 0, recibido {limit!r}")
++        if outbox_id is not None and (isinstance(outbox_id, bool) or not isinstance(outbox_id, int)):
++            raise ValueError(f"outbox_id: debe ser un entero o None, recibido {outbox_id!r}")
++        sql = ("SELECT requeue_id, outbox_id, requeued_by, reason, previous_attempts, previous_error, requeued_at FROM outbox_requeues "
++               + ("WHERE outbox_id = ? " if outbox_id is not None else "") + "ORDER BY requeue_id ASC LIMIT ?")
++        params = ((outbox_id, limit) if outbox_id is not None else (limit,))
++        return [tuple(r) for r in self._conn.execute(sql, params).fetchall()]
++
+     def acquire_publisher_lease(self, holder: str, lease_s: float, now: Optional[float] = None) -> bool:
+         """Toma el lease único del publicador del outbox si está libre, vencido o ya es de `holder`. Portable (solo SQLite) y válido entre
+         procesos. False si otro lo tiene vigente. El lease caduca solo (`lease_s`), así que un proceso muerto no bloquea para siempre."""
+--- a/src/dtos/inbox_outbox.py
++++ b/src/dtos/inbox_outbox.py
+@@ -98,6 +98,11 @@
+         D-65 (cuarentena): un payload que no es JSON es un fallo permanente y pasa a cuarentena en el acto; un fallo del sender cuenta un
+         intento y, al llegar a `max_attempts`, también. Los eventos en cuarentena dejan de ocupar la cabeza de la cola (no bloquean a los
+         siguientes) y se consultan con `SQLiteStore.get_quarantined_outbox()`; no se borran ni se reintentan solos.
++
++        D-66 (parche 0015): una cuarentena por un fallo TRANSITORIO (p. ej. el destino estuvo caído más de `max_attempts` corridas) se revierte
++        con `SQLiteStore.requeue_quarantined(outbox_id, requeued_by=..., reason=...)`, que lo anota en `outbox_requeues` y reinicia su contador.
++        Orden: el outbox NO garantiza el orden de entrega. Un fallo o una cuarentena no detiene a los eventos siguientes (decisión de
++        disponibilidad sobre orden estricto): un consumidor que dependa del orden debe ordenar o deduplicar por su cuenta.
+         """
+         if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
+             raise ValueError(f"max_attempts: debe ser un entero >= 1, recibido {max_attempts!r}")
+--- a/src/unae/store.py
++++ b/src/unae/store.py
+@@ -411,18 +411,25 @@
+                              "ORDER BY created_at,event_id LIMIT ?", (limit,)).fetchall()
+         return [{**dict(r), "payload": json.loads(r["payload"])} for r in rows]
+ 
+-    def claim_events(self, worker_id: str, limit: int = 100, lease_s: float = 30.0, now: float | None = None) -> list[dict[str, Any]]:
++    def claim_events(self, worker_id: str, limit: int = 100, lease_s: float = 30.0, now: float | None = None,
++                     *, max_attempts: int = 5) -> list[dict[str, Any]]:
+         """Reserva eventos PENDING sin dueño (o con lease vencido) para un despachador. Evita envíos dobles entre workers vivos.
+         D-65: un evento cuyo payload no es JSON NO se reclama: pasa a DEAD (revisión manual, `dead_events()`) en la misma transacción, para
+-        que una sola fila corrupta no bloquee la cola; el JSON se valida ANTES del commit, así un fallo no deja a todo el lote reclamado."""
++        que una sola fila corrupta no bloquee la cola; el JSON se valida ANTES del commit, así un fallo no deja a todo el lote reclamado.
++        D-66: reclamar un evento cuyo claim VENCIÓ sin que su dueño lo confirmara ni lo marcara fallido cuenta como un intento (el dueño pudo morir a
++        mitad del envío: OOM, os._exit, fallo de una librería nativa; ahí no hay `except Exception` que cuente). Al llegar a `max_attempts` el evento
++        pasa a DEAD en vez de reclamarse otra vez: un evento tóxico ya no produce un bucle de caídas indefinido. Un dueño lento pero sano también suma
++        un intento por cada vencimiento (sigue siendo at-least-once: el consumidor deduplica con consume_once). `dispatch_outbox` pasa su max_attempts."""
+         if not worker_id.strip() or lease_s <= 0:
+             raise ValueError("worker_id and positive lease_s required")
++        if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
++            raise ValueError("max_attempts: entero >= 1")
+         now = time.time() if now is None else now
+         claimed: list[dict[str, Any]] = []
+         with closing(self.connect()) as c:
+             c.execute("BEGIN IMMEDIATE")
+             try:
+-                rows = c.execute("SELECT event_id,commit_id,event_type,payload,attempts FROM outbox WHERE status='PENDING' "
++                rows = c.execute("SELECT event_id,commit_id,event_type,payload,attempts,claimed_by FROM outbox WHERE status='PENDING' "
+                                  "AND (claimed_by IS NULL OR claim_expires_at<=?) ORDER BY created_at,event_id LIMIT ?",
+                                  (now, limit)).fetchall()
+                 for r in rows:
+@@ -431,8 +438,17 @@
+                     except (ValueError, RecursionError):
+                         c.execute("UPDATE outbox SET status='DEAD',claimed_by=NULL,claim_expires_at=NULL WHERE event_id=?", (r["event_id"],))
+                         continue
+-                    c.execute("UPDATE outbox SET claimed_by=?,claim_expires_at=? WHERE event_id=?", (worker_id, now + lease_s, r["event_id"]))
+-                    claimed.append({**dict(r), "payload": payload})
++                    attempts = r["attempts"]
++                    if r["claimed_by"] is not None:  # D-66: claim vencido y abandonado (la consulta solo lo devuelve si claim_expires_at<=now)
++                        attempts += 1
++                        if attempts >= max_attempts:
++                            c.execute("UPDATE outbox SET status='DEAD',attempts=?,claimed_by=NULL,claim_expires_at=NULL WHERE event_id=?",
++                                      (attempts, r["event_id"]))
++                            continue
++                    c.execute("UPDATE outbox SET claimed_by=?,claim_expires_at=?,attempts=? WHERE event_id=?",
++                              (worker_id, now + lease_s, attempts, r["event_id"]))
++                    event = {k: r[k] for k in ("event_id", "commit_id", "event_type", "attempts")}  # misma forma que antes: sin claimed_by
++                    claimed.append({**event, "payload": payload, "attempts": attempts})
+                 self._commit(c, "claim_events")
+             except Exception:
+                 if c.in_transaction:  # D-65: si el COMMIT ya se hizo (fallo posterior) no hay nada que revertir ni se oculta el error real
+@@ -536,7 +552,7 @@
+         result = {"sent": 0, "failed": 0, "dead": 0, "lost": 0}
+         if paused is not None and paused():
+             return result
+-        events = self.claim_events(worker_id, limit, lease_s)
++        events = self.claim_events(worker_id, limit, lease_s, max_attempts=max_attempts)
+         for i, event in enumerate(events):
+             if paused is not None:
+                 try:

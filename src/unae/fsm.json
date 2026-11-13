@@ -1,0 +1,29 @@
+{
+  "CANCELLED": [],
+  "FAILED": [
+    "RECONCILED"
+  ],
+  "RECONCILED": [],
+  "RECONCILING": [
+    "FAILED",
+    "SUCCEEDED",
+    "UNKNOWN"
+  ],
+  "RESERVED": [
+    "CANCELLED",
+    "RUNNING"
+  ],
+  "RUNNING": [
+    "FAILED",
+    "SUCCEEDED",
+    "UNKNOWN"
+  ],
+  "SUCCEEDED": [
+    "RECONCILED"
+  ],
+  "UNKNOWN": [
+    "FAILED",
+    "RECONCILING",
+    "SUCCEEDED"
+  ]
+}

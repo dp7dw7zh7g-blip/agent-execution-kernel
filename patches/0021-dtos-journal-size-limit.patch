@@ -1,0 +1,53 @@
+--- a/src/dtos/store.py
++++ b/src/dtos/store.py
+@@ -111,6 +111,12 @@
+ # sqlite3.connect (5000 ms). Es un valor de política, no sale de mediciones: el operador puede cambiarlo con `busy_timeout_ms`.
+ DEFAULT_BUSY_TIMEOUT_MS = 10_000
+ 
++# D-73 (parche 0021): valor por defecto de `PRAGMA journal_size_limit` (bytes). 64 MiB es un valor de política propuesto y ratificado por el usuario, no sale de
++# mediciones. QUÉ HACE: tras un checkpoint completo, cuando el WAL se reinicia con la siguiente escritura, SQLite lo recorta a este tamaño en vez de dejarlo
++# del tamaño máximo alcanzado (por defecto de SQLite, -1, el archivo -wal se queda así hasta cerrar la última conexión). QUÉ NO HACE: no limita el
++# crecimiento del WAL mientras una lectura abierta (p. ej. `backup_to`) impide el checkpoint. -1 = sin límite (comportamiento nativo); 0 = recortar al mínimo.
++DEFAULT_JOURNAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024
++
+ # D-67 (parche 0016): reintento acotado de la APERTURA. SQLite puede devolver «database is locked» SIN esperar el busy_timeout cuando esperar
+ # podría causar un bloqueo mutuo (lo documenta SQLite). Medido en Windows 10 (g0.8 r17): con 8 procesos abriendo a la vez una base nueva, uno
+ # falló a los 4 ms (la apertura tardaba de 4 a 10 s por proceso porque el esquema son ~60 sentencias en autocommit con un fsync cada una).
+@@ -137,6 +143,9 @@
+       - `PRAGMA busy_timeout = busy_timeout_ms`: el driver reintenta solo ante un bloqueo temporal en lugar de fallar al instante.
+       - `PRAGMA journal_mode = WAL`: las lecturas no bloquean a la escritura ni al revés. Si la base no puede quedar en WAL (p. ej. un
+         sistema de archivos de red) se lanza RuntimeError al abrir; no se degrada en silencio a un modo sin esa garantía.
++      - `PRAGMA journal_size_limit = journal_size_limit_bytes` (D-73, 64 MiB por defecto; -1 sin límite, 0 recorte al mínimo): recorta el `-wal` tras un
++        checkpoint completo. Es por CONEXIÓN y lo aplica la conexión que escribe cuando el WAL se reinicia: una conexión que escribe sin este PRAGMA no
++        recorta. NO acota el crecimiento del WAL mientras una lectura abierta frena el checkpoint (p. ej. durante `backup_to`).
+       - Toda escritura pasa por `transaction()` (BEGIN IMMEDIATE): los escritores se serializan en el bloqueo de escritura y nunca hay una
+         promoción lectura->escritura que pueda fallar sin reintento. Excepción: la creación del esquema (`executescript`), que son
+         sentencias idempotentes (IF NOT EXISTS) y reintentan por el busy_timeout; las migraciones de columnas sí van en transacción.
+@@ -145,11 +154,15 @@
+     El timeout NO elimina los bloqueos: si otro proceso mantiene el bloqueo de escritura más de `busy_timeout_ms`, la operación lanza
+     sqlite3.OperationalError (no se reintenta aquí; la transacción no deja nada escrito)."""
+ 
+-    def __init__(self, db_path: str | Path, *, busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS):
++    def __init__(self, db_path: str | Path, *, busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
++                 journal_size_limit_bytes: int = DEFAULT_JOURNAL_SIZE_LIMIT_BYTES):
+         if isinstance(busy_timeout_ms, bool) or not isinstance(busy_timeout_ms, int) or busy_timeout_ms < 0:
+             raise ValueError(f"busy_timeout_ms: debe ser un entero >= 0 (milisegundos), recibido {busy_timeout_ms!r}")
++        if isinstance(journal_size_limit_bytes, bool) or not isinstance(journal_size_limit_bytes, int) or not (-1 <= journal_size_limit_bytes < 2 ** 63):
++            raise ValueError(f"journal_size_limit_bytes: debe ser un entero >= -1 (-1 = sin límite, 0 = recorte al mínimo), recibido {journal_size_limit_bytes!r}")
+         self.db_path = str(db_path)
+         self.busy_timeout_ms = busy_timeout_ms
++        self.journal_size_limit_bytes = journal_size_limit_bytes
+         self._conn = sqlite3.connect(self.db_path, timeout=busy_timeout_ms / 1000, isolation_level=None)  # autocommit off, control manual
+         try:
+             self._open_with_retry()
+@@ -194,6 +207,10 @@
+                 f"journal_mode: se pidió WAL y SQLite devolvió {mode!r} para {self.db_path!r} (¿sistema de archivos de red o sin soporte de "
+                 f"memoria compartida?). DTOS exige WAL para desacoplar lecturas y escrituras entre procesos."
+             )
++        self._conn.execute(f"PRAGMA journal_size_limit = {self.journal_size_limit_bytes};")  # int validado en __init__: no hay entrada externa en la sentencia
++        limit = self._conn.execute("PRAGMA journal_size_limit;").fetchone()[0]
++        if limit != self.journal_size_limit_bytes:
++            raise RuntimeError(f"journal_size_limit: pedido {self.journal_size_limit_bytes} bytes y SQLite quedó en {limit}")
+         self._conn.execute("PRAGMA foreign_keys = ON;")
+ 
+     def close(self) -> None:

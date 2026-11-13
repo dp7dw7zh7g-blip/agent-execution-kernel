@@ -1,0 +1,402 @@
+--- a/src/dtos/schema.sql
++++ b/src/dtos/schema.sql
+@@ -450,6 +450,25 @@
+     recorded_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+ );
+ 
++-- D-65 (parche 0014): fallos de publicación y cuarentena (dead-letter) del outbox. Un evento que no se puede publicar nunca
++-- (payload no JSON) o que agotó sus intentos pasa a quarantined = 1 y deja de ocupar la cabeza de la cola; la fila de `outbox`
++-- no se toca (el hecho sigue ahí para la revisión manual). No hay clave foránea: la cuarentena no debe bloquear nada.
++CREATE TABLE IF NOT EXISTS outbox_failures (
++    outbox_id        INTEGER PRIMARY KEY,
++    attempts          INTEGER NOT NULL CHECK (attempts >= 1),
++    last_error         TEXT NOT NULL,
++    quarantined         INTEGER NOT NULL DEFAULT 0 CHECK (quarantined IN (0, 1)),
++    updated_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
++);
++
++-- D-65: exclusión mutua del publicador del outbox entre procesos, portable (sustituye al flock del 0013, que no existe en Windows).
++-- Una sola fila: quien tiene un lease no vencido es el único publicador; el lease se renueva antes de cada envío y caduca solo.
++CREATE TABLE IF NOT EXISTS outbox_publisher_lease (
++    lease_name       TEXT PRIMARY KEY CHECK (lease_name = 'outbox'),
++    holder            TEXT NOT NULL,
++    expires_at         REAL NOT NULL
++);
++
+ CREATE TABLE IF NOT EXISTS inbox (
+     dedup_key        TEXT PRIMARY KEY,     -- idempotency/dedup identity
+     event_type        TEXT NOT NULL,
+--- a/src/dtos/store.py
++++ b/src/dtos/store.py
+@@ -34,6 +34,7 @@
+ 
+ import json
+ import sqlite3
++import time
+ from contextlib import contextmanager
+ from dataclasses import dataclass
+ from pathlib import Path
+@@ -178,8 +179,12 @@
+         try:
+             yield self._conn
+             self._conn.execute("COMMIT;")
+-        except Exception:
+-            self._conn.execute("ROLLBACK;")
++        except BaseException:  # D-65: también KeyboardInterrupt/SystemExit; si no, la transacción quedaba abierta y la conexión inservible
++            if self._conn.in_transaction:
++                try:
++                    self._conn.execute("ROLLBACK;")
++                except sqlite3.Error:
++                    pass  # no se oculta la excepción original con un fallo del propio ROLLBACK
+             raise
+ 
+     # -----------------------------------------------------------------
+@@ -544,12 +549,81 @@
+ 
+     def get_pending_outbox(self, limit: int = 100) -> list[tuple]:
+         """Lectura pública (solo lectura) del outbox: tuplas (outbox_id, event_type, payload_texto) de los eventos con published = 0,
+-        en orden de `outbox_id`, hasta `limit`. No reclama ni marca nada. `limit` debe ser un entero >= 0 (no bool): SQLite trata un LIMIT
++en orden de `outbox_id`, hasta `limit`, SIN los eventos en cuarentena (D-65). No reclama ni marca nada. `limit` debe ser un entero >= 0 (no bool): SQLite trata un LIMIT
+         negativo como «sin tope» y rechaza un no entero con un `datatype mismatch` poco claro, así que se valida aquí (ValueError)."""
+         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+             raise ValueError(f"limit: debe ser un entero >= 0, recibido {limit!r}")
+         return [tuple(r) for r in self._conn.execute(
+-            "SELECT outbox_id, event_type, payload FROM outbox WHERE published = 0 ORDER BY outbox_id ASC LIMIT ?", (limit,)).fetchall()]
++            "SELECT outbox_id, event_type, payload FROM outbox WHERE published = 0 "
++            "AND outbox_id NOT IN (SELECT outbox_id FROM outbox_failures WHERE quarantined = 1) ORDER BY outbox_id ASC LIMIT ?", (limit,)).fetchall()]
++
++    # -----------------------------------------------------------------
++    # OUTBOX: cuarentena y lease del publicador (D-65, parche 0014)
++    # -----------------------------------------------------------------
++
++    def record_outbox_failure(self, outbox_id: int, error: str, *, max_attempts: int = 5, permanent: bool = False) -> bool:
++        """Suma un intento fallido de publicación del evento. Pasa a CUARENTENA (deja de salir en `get_pending_outbox`; la fila de `outbox`
++        no se modifica) si `permanent` (p. ej. payload que no es JSON: reintentar no lo arregla) o si llega a `max_attempts`. Devuelve True
++        si el evento queda en cuarentena. Un evento ya en cuarentena sigue en cuarentena."""
++        if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
++            raise ValueError(f"max_attempts: debe ser un entero >= 1, recibido {max_attempts!r}")
++        text = str(error)[:500]
++        with self.transaction() as conn:
++            row = conn.execute("SELECT attempts, quarantined FROM outbox_failures WHERE outbox_id = ?", (outbox_id,)).fetchone()
++            attempts = (row[0] if row else 0) + 1
++            quarantined = 1 if (permanent or attempts >= max_attempts or (row is not None and row[1] == 1)) else 0
++            conn.execute(
++                "INSERT INTO outbox_failures (outbox_id, attempts, last_error, quarantined) VALUES (?, ?, ?, ?) "
++                "ON CONFLICT(outbox_id) DO UPDATE SET attempts = excluded.attempts, last_error = excluded.last_error, "
++                "quarantined = excluded.quarantined, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
++                (outbox_id, attempts, text, quarantined))
++        return bool(quarantined)
++
++    def get_quarantined_outbox(self, limit: int = 100) -> list[tuple]:
++        """Lectura pública (solo lectura) de la cuarentena: tuplas (outbox_id, event_type, attempts, last_error), en orden de `outbox_id`."""
++        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
++            raise ValueError(f"limit: debe ser un entero >= 0, recibido {limit!r}")
++        return [tuple(r) for r in self._conn.execute(
++            "SELECT o.outbox_id, o.event_type, f.attempts, f.last_error FROM outbox_failures f JOIN outbox o ON o.outbox_id = f.outbox_id "
++            "WHERE f.quarantined = 1 AND o.published = 0 ORDER BY o.outbox_id ASC LIMIT ?", (limit,)).fetchall()]
++
++    def acquire_publisher_lease(self, holder: str, lease_s: float, now: Optional[float] = None) -> bool:
++        """Toma el lease único del publicador del outbox si está libre, vencido o ya es de `holder`. Portable (solo SQLite) y válido entre
++        procesos. False si otro lo tiene vigente. El lease caduca solo (`lease_s`), así que un proceso muerto no bloquea para siempre."""
++        self._check_lease_args(holder, lease_s)
++        now = time.time() if now is None else now
++        with self.transaction() as conn:
++            row = conn.execute("SELECT holder, expires_at FROM outbox_publisher_lease WHERE lease_name = 'outbox'").fetchone()
++            if row is not None and row[0] != holder and row[1] > now:
++                return False
++            conn.execute("INSERT INTO outbox_publisher_lease (lease_name, holder, expires_at) VALUES ('outbox', ?, ?) "
++                         "ON CONFLICT(lease_name) DO UPDATE SET holder = excluded.holder, expires_at = excluded.expires_at",
++                         (holder, now + lease_s))
++        return True
++
++    def renew_publisher_lease(self, holder: str, lease_s: float, now: Optional[float] = None) -> bool:
++        """Extiende el lease SOLO si `holder` aún lo posee (si venció y otro lo tomó, False: hay que dejar de publicar)."""
++        self._check_lease_args(holder, lease_s)
++        now = time.time() if now is None else now
++        with self.transaction() as conn:
++            n = conn.execute("UPDATE outbox_publisher_lease SET expires_at = ? WHERE lease_name = 'outbox' AND holder = ?",
++                             (now + lease_s, holder)).rowcount
++        return n == 1
++
++    def release_publisher_lease(self, holder: str) -> bool:
++        """Libera el lease si `holder` lo posee; ignora el de otro. True si lo liberó."""
++        if not isinstance(holder, str) or not holder.strip():
++            raise ValueError("holder: texto no vacío")
++        with self.transaction() as conn:
++            n = conn.execute("DELETE FROM outbox_publisher_lease WHERE lease_name = 'outbox' AND holder = ?", (holder,)).rowcount
++        return n == 1
++
++    @staticmethod
++    def _check_lease_args(holder: str, lease_s: float) -> None:
++        if not isinstance(holder, str) or not holder.strip():
++            raise ValueError("holder: texto no vacío")
++        if isinstance(lease_s, bool) or not isinstance(lease_s, (int, float)) or not (0 < lease_s < 86400):
++            raise ValueError(f"lease_s: debe ser un número en (0, 86400) segundos, recibido {lease_s!r}")
+ 
+     def get_effect_reconciliations(self, attempt_id: str) -> list[dict]:
+         """Lectura pública (solo lectura) del historial append-only de reconciliaciones de un intento, en orden cronológico."""
+--- a/src/dtos/audit.py
++++ b/src/dtos/audit.py
+@@ -82,7 +82,8 @@
+         (FORKED). Un hueco en `seq`, o una cadena que no empieza en
+         seq=1, indica que una fila fue eliminada directamente en el
+         archivo, evadiendo el trigger (TRUNCATED). Un payload que no es
+-        JSON válido se informa como CORRUPTED (no lanza). Ver el LÍMITE
++        JSON válido, o que no se puede canonicalizar (NaN, Infinity, surrogate
++        aislado, anidación excesiva), se informa como CORRUPTED (no lanza; D-65). Ver el LÍMITE
+         DE LA GARANTÍA en el docstring del módulo: no detecta una cadena
+         reescrita con los hashes recalculados ni el borrado de las
+         últimas entradas.
+@@ -116,15 +117,18 @@
+ 
+             try:
+                 payload = json.loads(payload_text)
+-            except ValueError:
++                recomputed = content_hash({"prev_hash": prev_hash, "payload": payload})
++            except (TypeError, ValueError, RecursionError) as e:
++                # D-65: no solo un texto que no es JSON: también JSON que `json.loads` acepta y la forma canónica rechaza (NaN, Infinity,
++                # un surrogate aislado -> UnicodeEncodeError, que es un ValueError) o anidado hasta agotar la pila (RecursionError).
++                # Una fila que no se puede recalcular es una fila alterada: se informa, no se propaga.
+                 return AuditVerificationResult(
+                     status=AuditIntegrityState.CORRUPTED,
+                     total_entries=len(rows),
+                     first_bad_seq=seq,
+-                    detail=f"payload de seq={seq} no es JSON válido "
+-                    f"(el payload fue modificado directamente en el archivo)",
++                    detail=f"payload de seq={seq} no es un JSON canonicalizable "
++                    f"({type(e).__name__}); el payload fue modificado directamente en el archivo",
+                 )
+-            recomputed = content_hash({"prev_hash": prev_hash, "payload": payload})
+             if recomputed != entry_hash:
+                 return AuditVerificationResult(
+                     status=AuditIntegrityState.CORRUPTED,
+--- a/src/dtos/inbox_outbox.py
++++ b/src/dtos/inbox_outbox.py
+@@ -37,15 +37,10 @@
+ import json
+ import os
+ import sqlite3
+-from contextlib import contextmanager
++import uuid
+ from dataclasses import dataclass
+ from enum import Enum
+-from typing import Callable, Iterator, Optional
+-
+-try:
+-    import fcntl  # POSIX. Sin él no hay exclusión mutua entre procesos y publish_pending falla en lugar de degradarse en silencio.
+-except ImportError:  # pragma: no cover - plataformas sin fcntl
+-    fcntl = None  # type: ignore[assignment]
++from typing import Callable, Optional
+ 
+ from .canonical import canonical_json
+ from .store import SQLiteStore
+@@ -68,41 +63,21 @@
+     failed_count: int
+     failures: tuple  # tuple de (outbox_id, error_message)
+     skipped: bool = False  # True: otro proceso ya está publicando (D-64); esta corrida no hizo nada
++    quarantined_count: int = 0  # D-65: eventos que en ESTA corrida pasaron a cuarentena (payload no JSON o intentos agotados)
++    lease_lost: bool = False  # D-65: el lease venció y otro publicador lo tomó a mitad de la corrida; se detuvo sin enviar más
++
++
++DEFAULT_MAX_ATTEMPTS = 5
++DEFAULT_LEASE_S = 60.0
+ 
+ 
+ class OutboxPublisher:
+     def __init__(self, store: SQLiteStore):
+         self._store = store
+ 
+-    @contextmanager
+-    def _exclusive_publisher(self) -> Iterator[bool]:
+-        """Exclusión mutua entre PROCESOS (D-64): `flock` sobre `<db>.publish.lock`, fuera de cualquier transacción SQLite (P-016).
+-        Sin ella, dos publicadores leen las mismas filas pendientes y envían cada evento dos veces. Entrega True si esta corrida tiene
+-        el bloqueo y False si otro proceso ya lo tiene (no espera). El SO lo libera solo si el proceso muere. Una base en memoria no se
+-        comparte entre procesos y no lo necesita."""
+-        db_path = self._store.db_path
+-        if db_path in (":memory:", ""):
+-            yield True
+-            return
+-        if fcntl is None:
+-            raise RuntimeError("publish_pending exige exclusión mutua entre procesos (fcntl.flock) y esta plataforma no la ofrece")
+-        fd = os.open(f"{db_path}.publish.lock", os.O_CREAT | os.O_RDWR, 0o600)
+-        try:
+-            try:
+-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+-                acquired = True
+-            except BlockingIOError:
+-                acquired = False
+-            try:
+-                yield acquired
+-            finally:
+-                if acquired:
+-                    fcntl.flock(fd, fcntl.LOCK_UN)
+-        finally:
+-            os.close(fd)
+-
+     def publish_pending(
+-        self, sender_fn: Callable[[str, dict], None], limit: int = 100
++        self, sender_fn: Callable[[str, dict], None], limit: int = 100, *,
++        max_attempts: int = DEFAULT_MAX_ATTEMPTS, lease_s: float = DEFAULT_LEASE_S,
+     ) -> PublishResult:
+         """
+         Envía cada evento pendiente vía `sender_fn(event_type, payload)`
+@@ -114,34 +89,63 @@
+         -> el consumidor lo ve como redelivery y lo deduplica por su
+         cuenta (esto es exactamente el "at-least-once" del documento).
+ 
+-        D-64: solo un proceso publica a la vez (`_exclusive_publisher`); si otro ya lo hace, devuelve `PublishResult(0, 0, (), skipped=True)`
+-        sin leer ni enviar nada. Un payload que no es JSON se informa en `failures` y NO impide enviar los eventos siguientes.
++        D-65 (sustituye al `flock` del 0013, que no existe en Windows): solo un publicador a la vez, con un LEASE en SQLite
++        (`outbox_publisher_lease`), válido entre procesos y en cualquier plataforma. Si otro lo tiene vigente devuelve
++        `PublishResult(0, 0, (), skipped=True)` sin leer ni enviar nada. El lease dura `lease_s`, se renueva antes de CADA envío y
++        caduca solo si el proceso muere. Elegir `lease_s` mayor que el peor tiempo de UN envío. Si aun así se pierde (lo tomó otro),
++        la corrida se detiene antes de enviar más y lo informa en `lease_lost`; el envío en curso puede duplicarse (at-least-once).
++
++        D-65 (cuarentena): un payload que no es JSON es un fallo permanente y pasa a cuarentena en el acto; un fallo del sender cuenta un
++        intento y, al llegar a `max_attempts`, también. Los eventos en cuarentena dejan de ocupar la cabeza de la cola (no bloquean a los
++        siguientes) y se consultan con `SQLiteStore.get_quarantined_outbox()`; no se borran ni se reintentan solos.
+         """
+-        with self._exclusive_publisher() as acquired:
+-            if not acquired:
+-                return PublishResult(published_count=0, failed_count=0, failures=(), skipped=True)
+-            return self._publish_locked(sender_fn, limit)
++        if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
++            raise ValueError(f"max_attempts: debe ser un entero >= 1, recibido {max_attempts!r}")
++        holder = f"{os.getpid()}-{uuid.uuid4().hex}"
++        if not self._store.acquire_publisher_lease(holder, lease_s):
++            return PublishResult(published_count=0, failed_count=0, failures=(), skipped=True)
++        try:
++            return self._publish_locked(sender_fn, limit, max_attempts, lease_s, holder)
++        finally:
++            try:
++                self._store.release_publisher_lease(holder)
++            except sqlite3.Error:
++                pass  # no se oculta el resultado ni la excepción de la corrida; el lease caduca solo
+ 
+-    def _publish_locked(self, sender_fn: Callable[[str, dict], None], limit: int) -> PublishResult:
++    def _publish_locked(self, sender_fn: Callable[[str, dict], None], limit: int, max_attempts: int, lease_s: float, holder: str) -> PublishResult:
+         rows = self._store.get_pending_outbox(limit)
+ 
+         published = 0
++        quarantined = 0
+         failures = []
+ 
+         for outbox_id, event_type, payload_text in rows:
++            if not self._store.renew_publisher_lease(holder, lease_s):
++                return PublishResult(published_count=published, failed_count=len(failures), failures=tuple(failures),
++                                     quarantined_count=quarantined, lease_lost=True)
++            permanent = False
+             try:
+-                payload = json.loads(payload_text)
++                try:
++                    payload = json.loads(payload_text)
++                except (ValueError, RecursionError) as e:  # un payload ilegible no se arregla reintentando
++                    permanent = True
++                    raise ValueError(f"payload no es JSON válido: {e}") from e
+                 sender_fn(event_type, payload)
+             except Exception as e:  # noqa: BLE001 - el envío es de terceros (y el payload puede estar corrupto): cualquier fallo cuenta
+                 failures.append((outbox_id, str(e)))
+-                continue  # no se marca published; queda pendiente para la próxima corrida
++                try:
++                    if self._store.record_outbox_failure(outbox_id, str(e), max_attempts=max_attempts, permanent=permanent):
++                        quarantined += 1
++                except sqlite3.Error:
++                    pass  # no se pudo anotar el fallo: el evento sigue pendiente y se reintenta en la próxima corrida
++                continue  # no se marca published; queda pendiente (o en cuarentena) para la próxima corrida
+ 
+             # Marcado como su propia transacción local, después del envío.
+             with self._store.transaction() as conn:
+                 conn.execute("UPDATE outbox SET published = 1 WHERE outbox_id = ?", (outbox_id,))
+             published += 1
+ 
+-        return PublishResult(published_count=published, failed_count=len(failures), failures=tuple(failures))
++        return PublishResult(published_count=published, failed_count=len(failures), failures=tuple(failures), quarantined_count=quarantined)
+ 
+ 
+ class InboxProcessor:
+--- a/src/unae/store.py
++++ b/src/unae/store.py
+@@ -412,10 +412,13 @@
+         return [{**dict(r), "payload": json.loads(r["payload"])} for r in rows]
+ 
+     def claim_events(self, worker_id: str, limit: int = 100, lease_s: float = 30.0, now: float | None = None) -> list[dict[str, Any]]:
+-        """Reserva eventos PENDING sin dueño (o con lease vencido) para un despachador. Evita envíos dobles entre workers vivos."""
++        """Reserva eventos PENDING sin dueño (o con lease vencido) para un despachador. Evita envíos dobles entre workers vivos.
++        D-65: un evento cuyo payload no es JSON NO se reclama: pasa a DEAD (revisión manual, `dead_events()`) en la misma transacción, para
++        que una sola fila corrupta no bloquee la cola; el JSON se valida ANTES del commit, así un fallo no deja a todo el lote reclamado."""
+         if not worker_id.strip() or lease_s <= 0:
+             raise ValueError("worker_id and positive lease_s required")
+         now = time.time() if now is None else now
++        claimed: list[dict[str, Any]] = []
+         with closing(self.connect()) as c:
+             c.execute("BEGIN IMMEDIATE")
+             try:
+@@ -423,13 +426,45 @@
+                                  "AND (claimed_by IS NULL OR claim_expires_at<=?) ORDER BY created_at,event_id LIMIT ?",
+                                  (now, limit)).fetchall()
+                 for r in rows:
++                    try:
++                        payload = json.loads(r["payload"])
++                    except (ValueError, RecursionError):
++                        c.execute("UPDATE outbox SET status='DEAD',claimed_by=NULL,claim_expires_at=NULL WHERE event_id=?", (r["event_id"],))
++                        continue
+                     c.execute("UPDATE outbox SET claimed_by=?,claim_expires_at=? WHERE event_id=?", (worker_id, now + lease_s, r["event_id"]))
++                    claimed.append({**dict(r), "payload": payload})
+                 self._commit(c, "claim_events")
+-                return [{**dict(r), "payload": json.loads(r["payload"])} for r in rows]
+             except Exception:
+-                c.execute("ROLLBACK")
++                if c.in_transaction:  # D-65: si el COMMIT ya se hizo (fallo posterior) no hay nada que revertir ni se oculta el error real
++                    c.execute("ROLLBACK")
++                raise
++        return claimed
++
++    def renew_claim(self, event_id: str, worker_id: str, lease_s: float = 30.0, now: float | None = None) -> bool:
++        """D-65: extiende el lease de UN evento que `worker_id` aún posee (PENDING y reclamado por él, aunque el plazo ya haya vencido
++        mientras nadie más lo tomó). False si ya no es suyo: otro worker lo reclamó o dejó de estar PENDING; entonces NO debe enviarlo."""
++        if not isinstance(worker_id, str) or not worker_id.strip() or lease_s <= 0:
++            raise ValueError("worker_id and positive lease_s required")
++        now = time.time() if now is None else now
++        with closing(self.connect()) as c:
++            c.execute("BEGIN IMMEDIATE")
++            try:
++                n = c.execute("UPDATE outbox SET claim_expires_at=? WHERE event_id=? AND status='PENDING' AND claimed_by=?",
++                              (now + lease_s, event_id, worker_id)).rowcount
++                self._commit(c, "renew_claim")
++                return n == 1
++            except Exception:
++                if c.in_transaction:
++                    c.execute("ROLLBACK")
+                 raise
+ 
++    def dead_events(self, limit: int = 100) -> list[dict[str, Any]]:
++        """Lectura pública (solo lectura) de los eventos DEAD (revisión manual). El payload se devuelve como TEXTO: puede no ser JSON."""
++        with closing(self.connect()) as c:
++            rows = c.execute("SELECT event_id,commit_id,event_type,payload,attempts FROM outbox WHERE status='DEAD' "
++                             "ORDER BY created_at,event_id LIMIT ?", (limit,)).fetchall()
++        return [dict(r) for r in rows]
++
+     def mark_event_sent(self, event_id: str, worker_id: str | None = None) -> bool:
+         """Con worker_id solo tiene efecto si ese worker aún posee el claim (si perdió el lease devuelve False)."""
+         with closing(self.connect()) as c:
+@@ -492,7 +527,9 @@
+         por eso el consumidor debe deduplicar con consume_once. Elegir lease_s mayor que el peor tiempo de envío.
+         paused: función opcional sin argumentos; si devuelve True el despacho se detiene SIN reclamar y SIN contar intentos
+         (fuente apagada, sin cuota…: una pausa lógica no es un fallo). Se consulta antes de reclamar y antes de cada envío;
+-        lo ya reclamado y no enviado se libera de inmediato. El resultado conserva sus cuatro claves (una pausa no añade ninguna)."""
++        lo ya reclamado y no enviado se libera de inmediato. El resultado conserva sus cuatro claves (una pausa no añade ninguna).
++        D-65: el lease se RENUEVA antes de cada envío (`renew_claim`); si ya no es de este worker (venció y otro lo reclamó) el evento NO se
++        envía y cuenta como 'lost'. Por eso `lease_s` solo debe superar el peor tiempo de UN envío, no el del lote entero."""
+         if paused is not None and not callable(paused):
+             raise TypeError("paused debe ser una función sin argumentos o None")
+         worker_id = worker_id or f"w-{uuid.uuid4().hex[:8]}"
+@@ -510,6 +547,9 @@
+                 if halt:
+                     self.release_events([e["event_id"] for e in events[i:]], worker_id)
+                     break
++            if not self.renew_claim(event["event_id"], worker_id, lease_s):
++                result["lost"] += 1
++                continue
+             try:
+                 sender(event)
+             except Exception:

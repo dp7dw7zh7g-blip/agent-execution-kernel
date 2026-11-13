@@ -1,0 +1,72 @@
+--- a/src/dtos/store.py
++++ b/src/dtos/store.py
+@@ -523,6 +523,31 @@
+         cols = [d[0] for d in cur.description]
+         return [dict(zip(cols, row)) for row in cur.fetchall()]
+ 
++    def get_effect_by_provider_key(self, provider: str, idempotency_key: str) -> Optional[dict]:
++        """Lectura pública (solo lectura) del ledger `effects` por la clave única (provider, idempotency_key); None si no existe.
++        Existe para que quien diagnostica una colisión de esa clave no abra la conexión privada del Store."""
++        cur = self._conn.execute("SELECT * FROM effects WHERE provider = ? AND idempotency_key = ?", (provider, idempotency_key))
++        row = cur.fetchone()
++        if row is None:
++            return None
++        return dict(zip([d[0] for d in cur.description], row))
++
++    def read_audit_chain(self) -> list[tuple]:
++        """Lectura pública (solo lectura) de TODA la cadena de auditoría, en orden de `seq`: tuplas (seq, entry_hash, prev_hash, payload_texto).
++        La verificación de la cadena (AuditLog.verify) trabaja sobre esto; no valida nada por sí misma."""
++        return [tuple(r) for r in self._conn.execute("SELECT seq, entry_hash, prev_hash, payload FROM audit_log ORDER BY seq ASC").fetchall()]
++
++    def get_last_audit_hash(self) -> Optional[str]:
++        """Lectura pública: `entry_hash` de la última entrada de la cadena de auditoría; None si la cadena está vacía."""
++        row = self._conn.execute("SELECT entry_hash FROM audit_log ORDER BY seq DESC LIMIT 1").fetchone()
++        return row[0] if row is not None else None
++
++    def get_pending_outbox(self, limit: int = 100) -> list[tuple]:
++        """Lectura pública (solo lectura) del outbox: tuplas (outbox_id, event_type, payload_texto) de los eventos con published = 0,
++        en orden de `outbox_id`, hasta `limit`. No reclama ni marca nada."""
++        return [tuple(r) for r in self._conn.execute(
++            "SELECT outbox_id, event_type, payload FROM outbox WHERE published = 0 ORDER BY outbox_id ASC LIMIT ?", (limit,)).fetchall()]
++
+     def get_effect_reconciliations(self, attempt_id: str) -> list[dict]:
+         """Lectura pública (solo lectura) del historial append-only de reconciliaciones de un intento, en orden cronológico."""
+         cur = self._conn.execute("SELECT * FROM effect_reconciliations WHERE attempt_id = ? ORDER BY reconciliation_id", (attempt_id,))
+--- a/src/dtos/audit.py
++++ b/src/dtos/audit.py
+@@ -75,9 +75,7 @@
+         (FORKED). Un hueco en `seq` indica que una fila fue eliminada
+         directamente en el archivo, evadiendo el trigger (TRUNCATED).
+         """
+-        rows = self._store._conn.execute(
+-            "SELECT seq, entry_hash, prev_hash, payload FROM audit_log ORDER BY seq ASC"
+-        ).fetchall()
++        rows = self._store.read_audit_chain()
+ 
+         if not rows:
+             return AuditVerificationResult(status=AuditIntegrityState.VALID, total_entries=0)
+@@ -121,7 +119,5 @@
+         return AuditVerificationResult(status=AuditIntegrityState.VALID, total_entries=len(rows))
+ 
+     def last_hash(self) -> str:
+-        row = self._store._conn.execute(
+-            "SELECT entry_hash FROM audit_log ORDER BY seq DESC LIMIT 1"
+-        ).fetchone()
+-        return row[0] if row is not None else GENESIS_HASH
++        last = self._store.get_last_audit_hash()
++        return last if last is not None else GENESIS_HASH
+--- a/src/dtos/inbox_outbox.py
++++ b/src/dtos/inbox_outbox.py
+@@ -79,11 +79,7 @@
+         -> el consumidor lo ve como redelivery y lo deduplica por su
+         cuenta (esto es exactamente el "at-least-once" del documento).
+         """
+-        rows = self._store._conn.execute(
+-            "SELECT outbox_id, event_type, payload FROM outbox WHERE published = 0 "
+-            "ORDER BY outbox_id ASC LIMIT ?",
+-            (limit,),
+-        ).fetchall()
++        rows = self._store.get_pending_outbox(limit)
+ 
+         published = 0
+         failures = []

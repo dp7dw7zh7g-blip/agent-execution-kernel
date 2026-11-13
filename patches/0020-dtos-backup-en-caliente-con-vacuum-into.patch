@@ -1,0 +1,160 @@
+--- a/src/dtos/store.py
++++ b/src/dtos/store.py
+@@ -33,16 +33,18 @@
+ from __future__ import annotations
+ 
+ import json
++import os
+ import random
+ import sqlite3
+ import time
++import uuid
+ from contextlib import contextmanager
+ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Iterator, Optional
+ 
+ from .canonical import canonical_json, content_hash
+-from .enums import MandateEventType, MandateStrength, MandateTriggerKind
++from .enums import AuditIntegrityState, MandateEventType, MandateStrength, MandateTriggerKind
+ from .registries import ArtifactRecord, MandateRecord, PolicyRecord
+ from .validation import require_nonempty_str
+ 
+@@ -94,6 +96,16 @@
+     new_version: int
+ 
+ 
++@dataclass(frozen=True)
++class BackupResult:
++    """D-72: resultado de `SQLiteStore.backup_to`. `chain_verified` es True solo si se ejecutó `AuditChain.verify()` sobre la copia y dio VALID
++    (con `verify_chain=False` es False y `audit_entries` es solo el número de filas de la copia)."""
++    path: str
++    size_bytes: int
++    audit_entries: int
++    chain_verified: bool
++
++
+ # Espera máxima (ms) ante un bloqueo temporal de la base antes de lanzar sqlite3.OperationalError «database is locked». Mismo valor y misma
+ # estrategia que UNAE (unae/store.py: timeout=10 + PRAGMA busy_timeout=10000). Antes de D-57 DTOS dependía del `timeout=5.0` implícito de
+ # sqlite3.connect (5000 ms). Es un valor de política, no sale de mediciones: el operador puede cambiarlo con `busy_timeout_ms`.
+@@ -659,6 +671,120 @@
+         return len(ids)
+ 
+     # -----------------------------------------------------------------
++    # BACKUP EN CALIENTE (D-72, parche 0020)
++    # -----------------------------------------------------------------
++
++    def backup_to(self, target_path: str | os.PathLike, *, verify_chain: bool = True) -> BackupResult:
++        """D-72: copia de seguridad consistente de la base EN CALIENTE (con otras conexiones escribiendo) mediante `VACUUM INTO`, validada antes de
++        oficializarla. Pasos: (1) comprueba argumentos, que esta conexión NO esté en una transacción (`VACUUM` no puede ejecutarse dentro de una:
++        SQLite lanza «cannot VACUUM from within a transaction»; por eso no usa `transaction()` y corre en autocommit) y que el destino NO exista
++        (`FileExistsError`; nunca sobrescribe); (2) escribe la copia en un archivo temporal OCULTO del MISMO directorio (`.<nombre>.<uuid>.tmp`; el
++        directorio debe existir) con permisos 0600; (3) valida la copia: `PRAGMA integrity_check` y, con `verify_chain=True` (por defecto),
++        `AuditChain.verify()` abriéndola con `SQLiteStore`; cualquier fallo lanza `RuntimeError` y no deja ni destino ni temporales; (4) `fsync`
++        del archivo, vuelve a comprobar que el destino no apareció y lo mueve con `os.replace` (atómico en el mismo volumen); (5) `fsync` del
++        directorio donde el sistema operativo lo permite (POSIX). Devuelve `BackupResult`.
++        Qué garantiza: la copia es UNA instantánea coherente (una sola transacción de lectura), también si otro proceso escribe durante la copia;
++        conserva `sqlite_sequence` (los `outbox_id` y `seq` purgados no se reutilizan) y los triggers; queda compactada. En WAL no bloquea a los
++        escritores, pero mantiene una lectura abierta mientras dura: el checkpoint no puede avanzar y el `-wal` crece hasta que termina.
++        `verify_chain=False` existe para poder respaldar una base cuya cadena YA está alterada (conservar la prueba): sigue exigiendo
++        `integrity_check`, y el resultado lo declara (`chain_verified=False`).
++        Qué NO hace: no decide cuándo ni dónde respaldar, no rota ni purga copias (no se llama sola); no protege la copia frente a quien escribe en
++        el archivo (mismo límite de D-64); la validación cuesta O(n) en la cadena; la copia queda en modo WAL tras la validación (al abrirla con
++        `SQLiteStore`); entre la última comprobación y `os.replace` queda una ventana mínima en la que otro proceso podría crear el destino y
++        `os.replace` lo sobrescribiría (no hay creación exclusiva portable del destino)."""
++        try:
++            raw = os.fspath(target_path)
++        except TypeError:
++            raise TypeError(f"target_path: debe ser str o os.PathLike, recibido {type(target_path).__name__}") from None
++        if isinstance(target_path, bool) or not isinstance(raw, str):
++            raise TypeError(f"target_path: debe ser str o os.PathLike (texto), recibido {type(target_path).__name__}")
++        if not raw.strip():
++            raise ValueError("target_path: no puede estar vacío")
++        if not isinstance(verify_chain, bool):
++            raise ValueError(f"verify_chain: debe ser bool, recibido {verify_chain!r}")
++        if self._conn.in_transaction:
++            raise RuntimeError("backup_to: no puede ejecutarse dentro de una transacción (VACUUM INTO exige autocommit)")
++        target = Path(raw).absolute()
++        if not target.parent.is_dir():
++            raise FileNotFoundError(f"backup_to: el directorio de destino no existe: {str(target.parent)!r}")
++        if os.path.lexists(target):
++            raise FileExistsError(f"backup_to: el destino ya existe y no se sobrescribe: {str(target)!r}")
++        tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
++        try:
++            self._conn.execute("VACUUM INTO ?", (str(tmp),))
++            os.chmod(tmp, 0o600)
++            entries = self._verify_backup_copy(tmp, verify_chain)
++            size = tmp.stat().st_size
++            self._fsync_path(tmp)
++            if os.path.lexists(target):
++                raise FileExistsError(f"backup_to: el destino apareció mientras se copiaba y no se sobrescribe: {str(target)!r}")
++            os.replace(tmp, target)
++            self._fsync_dir(target.parent)
++        finally:
++            self._discard_backup_temp(tmp)
++        return BackupResult(path=str(target), size_bytes=size, audit_entries=entries, chain_verified=verify_chain)
++
++    def _verify_backup_copy(self, copy_path: Path, verify_chain: bool) -> int:
++        """Valida la copia temporal; devuelve el número de entradas de `audit_log`. RuntimeError si algo no cuadra."""
++        problems = self._integrity_problems(copy_path)
++        if problems:
++            raise RuntimeError(f"backup_to: la copia no pasa PRAGMA integrity_check: {problems[:5]!r}")
++        from .audit import AuditChain  # import tardío: audit.py importa este módulo
++        copy = SQLiteStore(copy_path, busy_timeout_ms=self.busy_timeout_ms)
++        try:
++            entries = copy.count_audit_entries()
++            if verify_chain:
++                verdict = AuditChain(copy).verify()
++                if verdict.status != AuditIntegrityState.VALID:
++                    raise RuntimeError(
++                        f"backup_to: la cadena de auditoría de la copia no es VALID ({verdict.status.name}, first_bad_seq={verdict.first_bad_seq}): "
++                        f"{verdict.detail}. Con verify_chain=False se puede respaldar igualmente una base ya alterada")
++        finally:
++            copy.close()
++        wal = Path(str(copy_path) + "-wal")
++        if wal.exists() and wal.stat().st_size > 0:
++            raise RuntimeError("backup_to: la copia validada dejó páginas sin integrar en su -wal; se descarta")
++        return entries
++
++    @staticmethod
++    def _integrity_problems(path: Path) -> list[str]:
++        """`PRAGMA integrity_check` sobre un archivo: lista vacía si SQLite responde «ok»."""
++        conn = sqlite3.connect(str(path))
++        try:
++            rows = [str(r[0]) for r in conn.execute("PRAGMA integrity_check").fetchall()]
++        finally:
++            conn.close()
++        return [] if rows == ["ok"] else rows
++
++    @staticmethod
++    def _fsync_path(path: Path) -> None:
++        fd = os.open(path, os.O_RDWR)
++        try:
++            os.fsync(fd)
++        finally:
++            os.close(fd)
++
++    @staticmethod
++    def _fsync_dir(directory: Path) -> None:
++        if os.name != "posix":  # Windows no permite abrir un directorio para fsync
++            return
++        fd = os.open(directory, os.O_RDONLY)
++        try:
++            os.fsync(fd)
++        finally:
++            os.close(fd)
++
++    @staticmethod
++    def _discard_backup_temp(tmp: Path) -> None:
++        """Borra el temporal y sus archivos auxiliares si quedaron (tras un `os.replace` correcto ya no existen). Limpieza best-effort: un fallo
++        aquí no debe ocultar la excepción original."""
++        for suffix in ("", "-wal", "-shm", "-journal"):
++            try:
++                os.remove(str(tmp) + suffix)
++            except OSError:
++                pass
++
++    # -----------------------------------------------------------------
+     # OUTBOX: cuarentena y lease del publicador (D-65, parche 0014)
+     # -----------------------------------------------------------------
+ 

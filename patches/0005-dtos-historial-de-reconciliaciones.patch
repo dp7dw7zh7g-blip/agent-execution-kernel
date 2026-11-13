@@ -1,0 +1,146 @@
+--- a/src/dtos/schema.sql
++++ b/src/dtos/schema.sql
+@@ -226,6 +226,41 @@
+ END;
+ 
+ -- ---------------------------------------------------------------------
++-- effect_reconciliations — historial APPEND-ONLY de cada reconciliación
++-- aceptada por la FSM, terminal o no (CONFIRMED, REJECTED, PARTIAL,
++-- UNKNOWN). Existe porque `effects` guarda UNA fila por efecto lógico
++-- (uq_effects_idempotency) y solo para resultados terminales: una fila
++-- PARTIAL ahí bloquearía para siempre la fila terminal del intento que
++-- complete el efecto con la misma idempotency_key. La evidencia (JSON
++-- canónico) se escribe en la MISMA
++-- transacción que el cambio de estado del intento.
++-- ---------------------------------------------------------------------
++CREATE TABLE IF NOT EXISTS effect_reconciliations (
++    reconciliation_id   INTEGER PRIMARY KEY AUTOINCREMENT,
++    attempt_id          TEXT NOT NULL,
++    from_status         TEXT NOT NULL,
++    to_status           TEXT NOT NULL,
++    strategy            TEXT NOT NULL,
++    evidence            TEXT NOT NULL,
++    recorded_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
++);
++
++CREATE INDEX IF NOT EXISTS ix_effect_reconciliations_attempt
++    ON effect_reconciliations (attempt_id);
++
++CREATE TRIGGER IF NOT EXISTS trg_effect_reconciliations_no_update
++BEFORE UPDATE ON effect_reconciliations
++BEGIN
++    SELECT RAISE(ABORT, 'effect_reconciliations es append-only: UPDATE prohibido');
++END;
++
++CREATE TRIGGER IF NOT EXISTS trg_effect_reconciliations_no_delete
++BEFORE DELETE ON effect_reconciliations
++BEGIN
++    SELECT RAISE(ABORT, 'effect_reconciliations es append-only: DELETE prohibido');
++END;
++
++-- ---------------------------------------------------------------------
+ -- REG-013 Recovery
+ -- ---------------------------------------------------------------------
+ CREATE TABLE IF NOT EXISTS recovery_runs (
+--- a/src/dtos/store.py
++++ b/src/dtos/store.py
+@@ -321,13 +321,15 @@
+         new_status: str,
+         expected_version: int,
+         effect_row: Optional[dict] = None,
++        reconciliation: Optional[dict] = None,
+     ) -> CommitResult:
+         """
+-        Transición del intento (optimistic concurrency) y, si es terminal,
+-        fila del ledger `effects` en UNA sola transacción: o quedan las dos
+-        o no queda ninguna. `effect_row` lleva effect_id, operation_id,
+-        intent_id, attempt_id, provider, idempotency_key y, opcional,
+-        evidence (JSON canónico de la evidencia de la reconciliación).
++        Transición del intento (optimistic concurrency), fila del ledger
++        `effects` si es terminal y fila del historial `effect_reconciliations`,
++        todo en UNA sola transacción: o quedan todas o no queda ninguna.
++        `effect_row` lleva effect_id, operation_id, intent_id, attempt_id,
++        provider, idempotency_key y, opcional, evidence (JSON canónico).
++        `reconciliation` lleva from_status, strategy y evidence (JSON canónico).
+         """
+         try:
+             with self.transaction() as conn:
+@@ -352,13 +354,22 @@
+                          effect_row["attempt_id"], effect_row["provider"], effect_row["idempotency_key"], new_status,
+                          effect_row.get("evidence")),
+                     )
++                if reconciliation is not None:
++                    conn.execute(
++                        """INSERT INTO effect_reconciliations
++                           (attempt_id, from_status, to_status, strategy, evidence)
++                           VALUES (?, ?, ?, ?, ?)""",
++                        (attempt_id, reconciliation["from_status"], new_status, reconciliation["strategy"], reconciliation["evidence"]),
++                    )
+                 return CommitResult(rows_affected=cur.rowcount, new_version=expected_version + 1)
+         except sqlite3.IntegrityError as e:
+-            raise ConflictError(
+-                f"reconcile_effect_attempt_atomic: ya existe un efecto con provider="
+-                f"{effect_row['provider']!r} idempotency_key={effect_row['idempotency_key']!r} "
+-                f"(misma key = misma operación); no se resolvió el intento."
+-            ) from e
++            if effect_row is not None:
++                raise ConflictError(
++                    f"reconcile_effect_attempt_atomic: ya existe un efecto con provider="
++                    f"{effect_row['provider']!r} idempotency_key={effect_row['idempotency_key']!r} "
++                    f"(misma key = misma operación); no se resolvió el intento."
++                ) from e
++            raise ConflictError(f"reconcile_effect_attempt_atomic: restricción de integridad violada: {e}") from e
+ 
+     def get_effects_by_attempt(self, attempt_id: str) -> list[dict]:
+         """Lectura pública (solo lectura) del ledger append-only `effects` para un intento."""
+@@ -366,6 +377,12 @@
+         cols = [d[0] for d in cur.description]
+         return [dict(zip(cols, row)) for row in cur.fetchall()]
+ 
++    def get_effect_reconciliations(self, attempt_id: str) -> list[dict]:
++        """Lectura pública (solo lectura) del historial append-only de reconciliaciones de un intento, en orden cronológico."""
++        cur = self._conn.execute("SELECT * FROM effect_reconciliations WHERE attempt_id = ? ORDER BY reconciliation_id", (attempt_id,))
++        cols = [d[0] for d in cur.description]
++        return [dict(zip(cols, row)) for row in cur.fetchall()]
++
+     def get_effect_attempt(self, attempt_id: str) -> Optional[dict]:
+         cur = self._conn.execute(
+             "SELECT attempt_id, intent_id, provider, idempotency_key, status, version "
+--- a/src/dtos/effect_repository.py
++++ b/src/dtos/effect_repository.py
+@@ -92,11 +92,15 @@
+         Única vía para resolver un intento en RECONCILIATION_REQUIRED.
+         Si el resultado es terminal (CONFIRMED/REJECTED), además de
+         actualizar effect_attempts, escribe la fila permanente en el
+-        ledger `effects` — en el mismo paso lógico, para que quien
++        ledger `effects`; toda reconciliación aceptada (también PARTIAL) deja además
++        una fila en el historial `effect_reconciliations` — en el mismo paso lógico, para que quien
+         consulte el ledger nunca vea un estado que no pasó por
+         reconcile() con evidencia real (I-005 cerrado de punta a punta).
+         """
+         loaded = self.load(attempt_id)
++        # Evidencia en forma canónica (P-064): se serializa una vez y se usa en el ledger y en el historial.
++        serialized_evidence = canonical_json(evidence)
++        from_status = loaded.fsm.state.value
+         loaded.fsm.reconcile(strategy=strategy, result=result_status, evidence=evidence)  # valida + exige evidencia
+ 
+         effect_row = None
+@@ -108,11 +112,14 @@
+                 "attempt_id": attempt_id,
+                 "provider": provider,
+                 "idempotency_key": idempotency_key,
+-                # Evidencia en forma canónica (P-064): queda en el ledger append-only junto al estado que justifica.
+-                "evidence": canonical_json(evidence),
++                # La evidencia queda en el ledger append-only junto al estado que justifica.
++                "evidence": serialized_evidence,
+             }
+ 
+-        # Una sola transacción: estado del intento + fila del ledger (antes eran dos).
+-        result = self._store.reconcile_effect_attempt_atomic(attempt_id, loaded.fsm.state.value, loaded.version, effect_row)
++        # Una sola transacción: estado del intento + fila del ledger (si es terminal) + historial de reconciliaciones (siempre, también PARTIAL).
++        result = self._store.reconcile_effect_attempt_atomic(
++            attempt_id, loaded.fsm.state.value, loaded.version, effect_row,
++            {"from_status": from_status, "strategy": strategy, "evidence": serialized_evidence},
++        )
+ 
+         return LoadedAttempt(fsm=loaded.fsm, version=result.new_version, operation_id=operation_id)

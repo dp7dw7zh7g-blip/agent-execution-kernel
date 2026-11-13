@@ -1,0 +1,85 @@
+--- a/src/dtos/store.py
++++ b/src/dtos/store.py
+@@ -92,12 +92,52 @@
+     new_version: int
+ 
+ 
++# Espera máxima (ms) ante un bloqueo temporal de la base antes de lanzar sqlite3.OperationalError «database is locked». Mismo valor y misma
++# estrategia que UNAE (unae/store.py: timeout=10 + PRAGMA busy_timeout=10000). Antes de D-57 DTOS dependía del `timeout=5.0` implícito de
++# sqlite3.connect (5000 ms). Es un valor de política, no sale de mediciones: el operador puede cambiarlo con `busy_timeout_ms`.
++DEFAULT_BUSY_TIMEOUT_MS = 10_000
++
++
+ class SQLiteStore:
+-    def __init__(self, db_path: str | Path):
++    """Persistencia de DTOS sobre un archivo SQLite compartido por varios procesos.
++
++    Política de concurrencia (D-57), explícita y verificada al abrir cada conexión:
++      - `PRAGMA busy_timeout = busy_timeout_ms`: el driver reintenta solo ante un bloqueo temporal en lugar de fallar al instante.
++      - `PRAGMA journal_mode = WAL`: las lecturas no bloquean a la escritura ni al revés. Si la base no puede quedar en WAL (p. ej. un
++        sistema de archivos de red) se lanza RuntimeError al abrir; no se degrada en silencio a un modo sin esa garantía.
++      - Toda escritura pasa por `transaction()` (BEGIN IMMEDIATE): los escritores se serializan en el bloqueo de escritura y nunca hay una
++        promoción lectura->escritura que pueda fallar sin reintento. Excepción: la creación del esquema (`executescript`), que son
++        sentencias idempotentes (IF NOT EXISTS) y reintentan por el busy_timeout; las migraciones de columnas sí van en transacción.
++    El timeout NO elimina los bloqueos: si otro proceso mantiene el bloqueo de escritura más de `busy_timeout_ms`, la operación lanza
++    sqlite3.OperationalError (no se reintenta aquí; la transacción no deja nada escrito)."""
++
++    def __init__(self, db_path: str | Path, *, busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS):
++        if isinstance(busy_timeout_ms, bool) or not isinstance(busy_timeout_ms, int) or busy_timeout_ms < 0:
++            raise ValueError(f"busy_timeout_ms: debe ser un entero >= 0 (milisegundos), recibido {busy_timeout_ms!r}")
+         self.db_path = str(db_path)
+-        self._conn = sqlite3.connect(self.db_path, isolation_level=None)  # autocommit off, control manual
++        self.busy_timeout_ms = busy_timeout_ms
++        self._conn = sqlite3.connect(self.db_path, timeout=busy_timeout_ms / 1000, isolation_level=None)  # autocommit off, control manual
++        try:
++            self._configure_connection()
++            self._init_schema()
++        except BaseException:
++            self._conn.close()
++            raise
++
++    def _configure_connection(self) -> None:
++        """PRAGMAs de concurrencia, ANTES de tocar el esquema (así el cambio a WAL y la creación de tablas ya reintentan ante bloqueos)."""
++        self._conn.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms};")  # int validado en __init__: no hay entrada externa en la sentencia
++        effective = self._conn.execute("PRAGMA busy_timeout;").fetchone()[0]
++        if effective != self.busy_timeout_ms:
++            raise RuntimeError(f"busy_timeout: pedido {self.busy_timeout_ms} ms y SQLite quedó en {effective} ms")
++        mode = str(self._conn.execute("PRAGMA journal_mode = WAL;").fetchone()[0]).lower()
++        in_memory = self.db_path in (":memory:", "")
++        if mode != "wal" and not (in_memory and mode == "memory"):
++            raise RuntimeError(
++                f"journal_mode: se pidió WAL y SQLite devolvió {mode!r} para {self.db_path!r} (¿sistema de archivos de red o sin soporte de "
++                f"memoria compartida?). DTOS exige WAL para desacoplar lecturas y escrituras entre procesos."
++            )
+         self._conn.execute("PRAGMA foreign_keys = ON;")
+-        self._init_schema()
+ 
+     def close(self) -> None:
+         self._conn.close()
+@@ -107,11 +147,22 @@
+         with open(schema_path, "r", encoding="utf-8") as f:
+             self._conn.executescript(f.read())
+         # Migración: bases creadas antes de que `effects` llevara `evidence` (CREATE TABLE IF NOT EXISTS no altera tablas existentes).
+-        if "evidence" not in {row[1] for row in self._conn.execute("PRAGMA table_info(effects)")}:
+-            self._conn.execute("ALTER TABLE effects ADD COLUMN evidence TEXT")
++        self._add_column_if_missing("effects", "evidence", "TEXT")
+         # Migración (parche 0008): bases creadas antes de que `policies` llevara `content`; las filas anteriores quedan con content NULL.
+-        if "content" not in {row[1] for row in self._conn.execute("PRAGMA table_info(policies)")}:
+-            self._conn.execute("ALTER TABLE policies ADD COLUMN content TEXT")
++        self._add_column_if_missing("policies", "content", "TEXT")
++
++    def _add_column_if_missing(self, table: str, column: str, declaration: str) -> None:
++        """Migración segura entre procesos (D-57): sin esto, dos procesos que abren a la vez una base antigua ven los dos «falta la columna» y
++        el segundo ALTER falla con «duplicate column name». Se comprueba sin bloqueo (camino habitual: no hay nada que migrar) y, si falta,
++        se vuelve a comprobar DENTRO de BEGIN IMMEDIATE antes del ALTER. Los tres argumentos son constantes del propio módulo."""
++        def has_column(conn: sqlite3.Connection) -> bool:
++            return column in {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
++
++        if has_column(self._conn):
++            return
++        with self.transaction() as conn:
++            if not has_column(conn):
++                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+ 
+     @contextmanager
+     def transaction(self) -> Iterator[sqlite3.Connection]:

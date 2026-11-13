@@ -1,0 +1,67 @@
+--- a/src/unae/store.py
++++ b/src/unae/store.py
+@@ -8,6 +8,7 @@
+ import time
+ import uuid
+ import weakref
++from collections.abc import Callable, Iterable
+ from dataclasses import dataclass
+ from enum import StrEnum
+ from pathlib import Path
+@@ -462,14 +463,53 @@
+                 c.execute("ROLLBACK")
+                 raise
+ 
++    def release_events(self, event_ids: Iterable[str], worker_id: str) -> int:
++        """Devuelve a la cola, SIN contar intento, los eventos PENDING que este worker aún tiene reclamados (pausa, no fallo).
++        Ignora los que ya no son suyos (lease vencido y retomado por otro) o ya no están PENDING. Devuelve cuántos liberó."""
++        if not isinstance(worker_id, str) or not worker_id.strip():
++            raise ValueError("worker_id required")
++        ids = list(event_ids)
++        if not ids:
++            return 0
++        with closing(self.connect()) as c:
++            c.execute("BEGIN IMMEDIATE")
++            try:
++                n = 0
++                for event_id in ids:
++                    n += c.execute("UPDATE outbox SET claimed_by=NULL,claim_expires_at=NULL "
++                                   "WHERE event_id=? AND status='PENDING' AND claimed_by=?", (event_id, worker_id)).rowcount
++                self._commit(c, "release_events")
++                return n
++            except Exception:
++                c.execute("ROLLBACK")
++                raise
++
+     def dispatch_outbox(self, sender, limit: int = 100, max_attempts: int = 5,
+-                        worker_id: str | None = None, lease_s: float = 30.0) -> dict[str, int]:
++                        worker_id: str | None = None, lease_s: float = 30.0,
++                        paused: Callable[[], bool] | None = None) -> dict[str, int]:
+         """Reclama eventos con lease y llama a sender(event) FUERA de toda transacción.
+         'lost' cuenta eventos cuyo lease venció antes de confirmar: otro worker pudo reenviarlos (al menos una vez),
+-        por eso el consumidor debe deduplicar con consume_once. Elegir lease_s mayor que el peor tiempo de envío."""
++        por eso el consumidor debe deduplicar con consume_once. Elegir lease_s mayor que el peor tiempo de envío.
++        paused: función opcional sin argumentos; si devuelve True el despacho se detiene SIN reclamar y SIN contar intentos
++        (fuente apagada, sin cuota…: una pausa lógica no es un fallo). Se consulta antes de reclamar y antes de cada envío;
++        lo ya reclamado y no enviado se libera de inmediato. El resultado conserva sus cuatro claves (una pausa no añade ninguna)."""
++        if paused is not None and not callable(paused):
++            raise TypeError("paused debe ser una función sin argumentos o None")
+         worker_id = worker_id or f"w-{uuid.uuid4().hex[:8]}"
+         result = {"sent": 0, "failed": 0, "dead": 0, "lost": 0}
+-        for event in self.claim_events(worker_id, limit, lease_s):
++        if paused is not None and paused():
++            return result
++        events = self.claim_events(worker_id, limit, lease_s)
++        for i, event in enumerate(events):
++            if paused is not None:
++                try:
++                    halt = paused()
++                except BaseException:
++                    self.release_events([e["event_id"] for e in events[i:]], worker_id)
++                    raise
++                if halt:
++                    self.release_events([e["event_id"] for e in events[i:]], worker_id)
++                    break
+             try:
+                 sender(event)
+             except Exception:

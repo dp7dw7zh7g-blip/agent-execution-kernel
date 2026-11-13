@@ -1,0 +1,88 @@
+--- a/src/dtos/schema.sql
++++ b/src/dtos/schema.sql
+@@ -206,7 +206,8 @@
+     provider             TEXT NOT NULL,
+     idempotency_key       TEXT NOT NULL,
+     status                TEXT NOT NULL,
+-    recorded_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
++    recorded_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
++    evidence              TEXT   -- JSON canónico de la evidencia con la que se resolvió el intento (NULL en filas anteriores o escritas sin evidencia)
+ );
+ 
+ CREATE UNIQUE INDEX IF NOT EXISTS uq_effects_idempotency
+--- a/src/dtos/store.py
++++ b/src/dtos/store.py
+@@ -87,6 +87,9 @@
+         schema_path = Path(__file__).parent / "schema.sql"
+         with open(schema_path, "r", encoding="utf-8") as f:
+             self._conn.executescript(f.read())
++        # Migración: bases creadas antes de que `effects` llevara `evidence` (CREATE TABLE IF NOT EXISTS no altera tablas existentes).
++        if "evidence" not in {row[1] for row in self._conn.execute("PRAGMA table_info(effects)")}:
++            self._conn.execute("ALTER TABLE effects ADD COLUMN evidence TEXT")
+ 
+     @contextmanager
+     def transaction(self) -> Iterator[sqlite3.Connection]:
+@@ -259,15 +262,16 @@
+         provider: str,
+         idempotency_key: str,
+         status: str,
++        evidence: Optional[str] = None,
+     ) -> None:
+         try:
+             with self.transaction() as conn:
+                 conn.execute(
+                     """INSERT INTO effects
+                        (effect_id, operation_id, intent_id, attempt_id,
+-                        provider, idempotency_key, status)
+-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+-                    (effect_id, operation_id, intent_id, attempt_id, provider, idempotency_key, status),
++                        provider, idempotency_key, status, evidence)
++                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
++                    (effect_id, operation_id, intent_id, attempt_id, provider, idempotency_key, status, evidence),
+                 )
+         except sqlite3.IntegrityError as e:
+             raise ConflictError(
+@@ -322,7 +326,8 @@
+         Transición del intento (optimistic concurrency) y, si es terminal,
+         fila del ledger `effects` en UNA sola transacción: o quedan las dos
+         o no queda ninguna. `effect_row` lleva effect_id, operation_id,
+-        intent_id, attempt_id, provider e idempotency_key.
++        intent_id, attempt_id, provider, idempotency_key y, opcional,
++        evidence (JSON canónico de la evidencia de la reconciliación).
+         """
+         try:
+             with self.transaction() as conn:
+@@ -341,10 +346,11 @@
+                     conn.execute(
+                         """INSERT INTO effects
+                            (effect_id, operation_id, intent_id, attempt_id,
+-                            provider, idempotency_key, status)
+-                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
++                            provider, idempotency_key, status, evidence)
++                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                         (effect_row["effect_id"], effect_row["operation_id"], effect_row["intent_id"],
+-                         effect_row["attempt_id"], effect_row["provider"], effect_row["idempotency_key"], new_status),
++                         effect_row["attempt_id"], effect_row["provider"], effect_row["idempotency_key"], new_status,
++                         effect_row.get("evidence")),
+                     )
+                 return CommitResult(rows_affected=cur.rowcount, new_version=expected_version + 1)
+         except sqlite3.IntegrityError as e:
+--- a/src/dtos/effect_repository.py
++++ b/src/dtos/effect_repository.py
+@@ -22,6 +22,7 @@
+ import uuid
+ from dataclasses import dataclass
+ 
++from .canonical import canonical_json
+ from .effect_fsm import EffectFSM
+ from .enums import EffectStatus as S
+ from .store import ConflictError, SQLiteStore
+@@ -107,6 +108,8 @@
+                 "attempt_id": attempt_id,
+                 "provider": provider,
+                 "idempotency_key": idempotency_key,
++                # Evidencia en forma canónica (P-064): queda en el ledger append-only junto al estado que justifica.
++                "evidence": canonical_json(evidence),
+             }
+ 
+         # Una sola transacción: estado del intento + fila del ledger (antes eran dos).

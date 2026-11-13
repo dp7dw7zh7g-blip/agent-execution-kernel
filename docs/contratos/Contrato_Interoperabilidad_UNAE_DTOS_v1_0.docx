@@ -1,0 +1,275 @@
+Contrato de interoperabilidad UNAE 4.3S rev3 ↔ DTOS
+
+Versión: 1.0 — propuesta normativa para cierre de diseño
+
+Estado: contrato de diseño consolidado; implementación y pruebas de integración pendientes
+
+Fecha: 2026-10-23
+
+Alcance: integración lógica entre UNAE 4.3S rev3 y el paquete DTOS entregado. No modifica ninguno de los paquetes originales.
+
+## 1. Decisión arquitectónica
+
+UNAE y DTOS mantienen máquinas de estados separadas. No se fusionan FSM, no se equiparan estados por compartir nombre y ningún componente puede escribir directamente el estado interno del otro.
+
+**UNAE** es la autoridad sobre el ciclo transaccional de la operación: `RESERVED`, `RUNNING`, `UNKNOWN`, `RECONCILING`, `SUCCEEDED`, `FAILED`, `CANCELLED`, `RECONCILED`.
+
+**DTOS CognitiveCycleFSM** gobierna el ciclo cognitivo. `COMPLETED` significa que terminó el ciclo cognitivo; no prueba que una operación externa haya tenido éxito.
+
+**DTOS EffectFSM** gobierna un intento de efecto externo y su reconciliación.
+
+**DTOS RecoveryTriggerFSM / BootstrapFSM** gobiernan, respectivamente, la declaración/inicio de recuperación y el bootstrap de autoridad. No sustituyen la reconciliación transaccional de UNAE.
+
+`OperationClosureState` existe como enum en DTOS, pero en el paquete auditado no se identificó una FSM de transiciones equivalente. No se le atribuye una semántica operacional no demostrada.
+
+## 2. Autoridad y límites
+
+DTOS puede producir una propuesta, un plan, una intención de efecto o evidencia; ninguno de esos objetos autoriza por sí solo una ejecución.
+
+La autorización efectiva, la reserva, el fencing y las transiciones transaccionales se resuelven por el mecanismo de control correspondiente, con UNAE como autoridad de su FSM de operación.
+
+DTOS no puede marcar una operación UNAE como `SUCCEEDED`, `FAILED` o `RECONCILED` mediante una actualización directa.
+
+UNAE no debe inferir que el ciclo cognitivo terminó correctamente porque la operación terminó correctamente, ni viceversa.
+
+La integración debe ser mediante comandos/eventos explícitos, idempotentes y correlacionables; nunca mediante mutación directa de tablas internas del otro sistema.
+
+## 3. Identidades y correlación obligatorias
+
+Cada mensaje de integración debe incluir, cuando aplique:
+
+`contract_version`: versión del contrato (`1.0`).
+
+`correlation_id`: identificador estable de la interacción extremo a extremo.
+
+`cognitive_cycle_id`: identificador del ciclo DTOS que originó la decisión (si existe).
+
+`operation_id`: identificador de operación UNAE. Es obligatorio para toda acción que pretenda iniciar, consultar o reconciliar una operación.
+
+`effect_intent_id`: identificador de la intención de efecto DTOS, cuando haya efecto externo.
+
+`effect_attempt_id`: identificador del intento concreto; nuevo para cada intento autorizado.
+
+`idempotency_key`: clave estable por intención lógica de efecto; no se cambia solo para sortear un resultado incierto.
+
+`evidence_refs`: referencias inmutables a recibos, consultas de proveedor, observaciones independientes o confirmación humana.
+
+`authority_ref` y `fencing_token`: cuando el tipo de operación requiera autoridad/lease/fencing.
+
+`created_at` y `schema_version`: metadatos para trazabilidad y evolución del esquema.
+
+Los identificadores no se reutilizan para entidades distintas. El correlation_id correlaciona; no sustituye la identidad propia de ciclo, operación, intención o intento.
+
+## 4. Contrato de ejecución
+
+Flujo permitido:
+
+DTOS completa verificación y produce una propuesta/plan con referencias a sus evidencias.
+
+La capa de política/autorización valida permisos, capacidades, estado, recursos y autoridad. Una transición a `READY_TO_COMMIT` o `COMMITTING` en DTOS no equivale a autorización de UNAE.
+
+El coordinador solicita a UNAE crear/reservar o adquirir autoridad para `operation_id` según su API vigente.
+
+Solo después de autorización y reserva válidas se puede despachar el efecto externo asociado.
+
+El resultado del proveedor se registra como recibo/evidencia. Un mensaje de éxito sin evidencia verificable no basta para confirmar un efecto.
+
+UNAE y DTOS actualizan cada una su propio estado mediante sus transiciones y guardas existentes.
+
+La integración debe fallar cerrada si faltan identificadores requeridos, la autorización expiró, el fencing es inválido, la versión del contrato no es compatible o hay contradicción entre el resultado y la evidencia.
+
+## 5. Semántica de incertidumbre y reconciliación
+
+### 5.1 `UNKNOWN` no es un resultado terminal de éxito ni de fracaso
+
+UNKNOWN de UNAE, UNKNOWN de CognitiveCycleFSM y UNKNOWN de EffectFSM son estados locales distintos. No se convierten entre sí por nombre ni por traducción automática.
+
+### 5.2 Efecto DTOS incierto
+
+Cuando un intento de efecto pasa a UNKNOWN, DTOS debe exigir RECONCILIATION_REQUIRED. La resolución se realiza mediante EffectFSM.reconcile(...), con estrategia reconocida y evidencia no vacía. La ausencia de un registro (NOT_FOUND) no prueba por sí sola que el efecto fue rechazado ni que no ocurrió.
+
+Estrategias reconocidas por el código DTOS auditado: PROVIDER_QUERY, IDEMPOTENCY_LOOKUP, EXTERNAL_REFERENCE_LOOKUP, READ_AFTER_WRITE, EVENT_CONFIRMATION, INDEPENDENT_OBSERVATION, HUMAN_CONFIRMATION.
+
+### 5.3 Operación UNAE incierta
+
+Si UNAE está en UNKNOWN, no se crea automáticamente una operación sustituta ni se repite el efecto. Se entra al proceso de reconciliación de UNAE (UNKNOWN → RECONCILING) y se busca evidencia para resolver el resultado. La repetición solo puede autorizarse después de una decisión explícita basada en el resultado de reconciliación, la clave de idempotencia y las garantías del proveedor.
+
+### 5.4 Correspondencia de resultados
+
+Efecto `CONFIRMED` no obliga por sí solo a operación UNAE `SUCCEEDED`: se deben validar el alcance del efecto, recibo, política y restantes condiciones de cierre.
+
+Efecto `REJECTED` no obliga por sí solo a operación UNAE `FAILED`: debe corresponder al resultado completo de la operación y a su evidencia.
+
+Efecto `PARTIAL` no se trata como éxito completo. En DTOS, la FSM de efecto indica que completar requiere un nuevo `EffectAttempt`, fuera de esa FSM.
+
+Si evidencia es insuficiente o contradictoria, se conserva la incertidumbre o se escala a revisión humana; no se inventa una resolución por defecto.
+
+## 6. Cierre y reconciliación de UNAE
+
+La FSM canónica de UNAE rev3 es:
+
+`RESERVED → RUNNING | CANCELLED`
+
+`RUNNING → UNKNOWN | SUCCEEDED | FAILED`
+
+`UNKNOWN → RECONCILING | SUCCEEDED | FAILED`
+
+`RECONCILING → UNKNOWN | SUCCEEDED | FAILED`
+
+`SUCCEEDED → RECONCILED`
+
+`FAILED → RECONCILED`
+
+`CANCELLED` y `RECONCILED` no tienen transiciones salientes.
+
+La integración no agrega transiciones a esa FSM. RECONCILED significa que el proceso de reconciliación/cierre de UNAE concluyó conforme a sus reglas; no debe usarse como sinónimo genérico de «el proveedor respondió».
+
+## 7. Recuperación y autoridad
+
+`RecoveryTriggerFSM` de DTOS requiere evidencia y un `declared_by` no vacío para declarar un fallo (`SUSPECT → DECLARED`). El código de la FSM no verifica por sí solo que esa identidad tenga autoridad vigente; esa validación pertenece a la capa de dominio/autoridad.
+
+`BootstrapFSM` no permite salir de `BOOTSTRAP_CONFLICT` ni `BOOTSTRAP_INCOMPLETE` mediante transiciones normales. La integración no debe eludir esa protección.
+
+La recuperación de DTOS no autoriza reintentar operaciones UNAE inciertas. Cada operación recuperada debe inspeccionarse y reconciliarse según su estado transaccional y evidencia.
+
+Un líder/propietario obsoleto no debe poder confirmar efectos tras perder su autoridad. Cuando aplique, se verifican lease, fencing token y autoridad vigente en el límite de ejecución.
+
+## 8. Invariantes normativos
+
+**I-01 — FSM separadas:** ningún estado interno se copia o escribe directamente entre FSM.
+
+**I-02 — Sin autorización implícita:** razonamiento completado, plan aprobado o `READY_TO_COMMIT` no autorizan por sí solos una ejecución externa.
+
+**I-03 — Correlación completa:** toda operación/efecto se vincula mediante IDs explícitos y estables.
+
+**I-04 — No equivalencia de UNKNOWN:** la interpretación depende de la FSM propietaria.
+
+**I-05 — No retry ciego:** un intento incierto requiere reconciliación antes de reintentar el mismo efecto lógico.
+
+**I-06 — Evidencia para resolver:** los estados inciertos solo se resuelven por el mecanismo protegido correspondiente y con evidencia suficiente.
+
+**I-07 — No asumir NOT_FOUND:** la ausencia de una observación no equivale automáticamente a rechazo o ausencia de efecto.
+
+**I-08 — Sin éxito por propagación:** `EffectStatus.CONFIRMED` no fuerza `UNAE SUCCEEDED` ni `CognitiveCycle COMPLETED`.
+
+**I-09 — Sin cierre por respuesta aislada:** una respuesta externa no fuerza `UNAE RECONCILED`.
+
+**I-10 — Autoridad vigente:** validar autorización, lease y fencing en el límite de ejecución cuando aplique.
+
+**I-11 — Idempotencia:** duplicados de mensajes no deben duplicar operaciones o efectos; las claves y deduplicación deben conservarse.
+
+**I-12 — Auditoría:** cada decisión de transición y reconciliación conserva actor, motivo, timestamps y referencias a evidencia.
+
+**I-13 — Contrato versionado:** mensajes con versión incompatible se rechazan o se ponen en cuarentena; no se interpretan silenciosamente.
+
+**I-14 — Fallo seguro:** ante contradicción o falta de datos esenciales, no se inventa un resultado; se conserva incertidumbre o se escala.
+
+## 9. Tabla de mapeo semántico (no es una tabla de transición)
+
+| Evento observado | Interpretación permitida | Acción de integración | Inferencia prohibida |
+
+|---|---|---|---|
+
+| DTOS CognitiveCycle `COMPLETED` | El ciclo cognitivo terminó | Consumir su resultado verificado y pasar por autorización | Marcar operación UNAE como `SUCCEEDED` |
+
+| DTOS Effect `CONFIRMED` | Ese intento de efecto tiene confirmación según evidencia | Adjuntar recibo/evidencia a la operación vinculada y evaluar cierre | Marcar automáticamente UNAE `SUCCEEDED`/`RECONCILED` |
+
+| DTOS Effect `UNKNOWN` | Resultado del intento desconocido | Exigir reconciliación DTOS y coordinar con UNAE si la operación está incierta | Reintentar inmediatamente |
+
+| UNAE `UNKNOWN` | Resultado transaccional desconocido | Iniciar reconciliación UNAE y bloquear repetición ciega | Tratarlo como fallo o éxito definitivo |
+
+| UNAE `SUCCEEDED` | Operación declarada exitosa por UNAE según su lógica | Permitir el paso de cierre `RECONCILED` conforme a reglas UNAE | Cambiar directamente FSM cognitiva a `COMPLETED` |
+
+| RecoveryTrigger `DECLARED` | Se declaró fallo de nodo bajo un actor identificado y evidencia | Activar el flujo de recuperación de DTOS; revisar operaciones afectadas | Reintentar todas las operaciones pendientes indiscriminadamente |
+
+| Bootstrap `BOOTSTRAP_CONFLICT` | Conflicto de bootstrap que requiere intervención externa | Detener activación automática y escalar | Sobrescribir génesis o continuar como `ACTIVE` |
+
+## 10. Contrato mínimo del mensaje de integración
+
+Esquema lógico orientativo; los campos condicionales deben validarse según message_type:
+
+json
+
+{
+
+  "contract_version": "1.0",
+
+  "schema_version": "1",
+
+  "message_id": "unique-message-id",
+
+  "message_type": "OPERATION_REQUEST | EFFECT_DISPATCHED | EFFECT_RESULT | RECONCILIATION_RESULT | RECOVERY_NOTICE",
+
+  "correlation_id": "stable-correlation-id",
+
+  "cognitive_cycle_id": "optional-cycle-id",
+
+  "operation_id": "required-for-operation-events",
+
+  "effect_intent_id": "optional-effect-intent-id",
+
+  "effect_attempt_id": "optional-effect-attempt-id",
+
+  "idempotency_key": "required-for-effect-dispatch",
+
+  "authority_ref": "required-when-policy-demands-authority",
+
+  "fencing_token": "required-when-fencing-applies",
+
+  "result": "message-type-specific-enum",
+
+  "evidence_refs": [],
+
+  "created_at": "RFC3339 timestamp"
+
+}
+
+Este bloque es un contrato lógico inicial, no un esquema JSON Schema validado ni una API ya implementada. Los valores de message_type y result deben convertirse en enums versionados al implementar el adaptador.
+
+## 11. Pruebas de aceptación requeridas antes de integrar en producción
+
+Ciclo cognitivo `COMPLETED` sin autorización válida no provoca dispatch.
+
+Mensajes duplicados con el mismo `message_id` no duplican una operación ni un efecto.
+
+`EffectFSM.UNKNOWN` no permite dispatch de reintento antes de reconciliar.
+
+`RECONCILIATION_REQUIRED` no se resuelve sin estrategia admitida y evidencia no vacía.
+
+`NOT_FOUND` sin evidencia concluyente no se convierte automáticamente en `REJECTED`.
+
+UNAE `UNKNOWN` activa reconciliación y no crea una operación sustituta automáticamente.
+
+Un resultado de efecto confirmado no fuerza por sí solo UNAE `SUCCEEDED`.
+
+Una respuesta aislada del proveedor no fuerza UNAE `RECONCILED`.
+
+Lease/fencing inválido impide el dispatch o la confirmación según el límite definido.
+
+10. Una caída entre dispatch y persistencia del recibo se recupera sin repetir ciegamente el efecto.
+
+11. BOOTSTRAP_CONFLICT bloquea activación automática.
+
+12. Las transiciones prohibidas se rechazan y dejan evidencia auditable.
+
+13. Versiones de contrato incompatibles se rechazan o quedan en cuarentena.
+
+14. La suite existente de UNAE y DTOS se ejecuta por separado; la suite de integración se ejecuta adicionalmente. Los resultados se registran sin presentar pruebas omitidas como aprobadas.
+
+## 12. Criterio de cierre
+
+El diseño del contrato se considera cerrado cuando se aceptan las reglas de las secciones 1–10. La integración de software no se considera cerrada hasta que exista adaptador implementado y las pruebas de la sección 11 pasen en un entorno reproducible.
+
+Pendientes de implementación, no de semántica básica:
+
+Definir el JSON Schema formal de mensajes y el transporte elegido.
+
+Mapear los métodos reales de las APIs de UNAE y DTOS al adaptador, sin acceder a tablas privadas.
+
+Definir política de retención, reintentos del transporte, timeout y cuarentena de mensajes incompatibles.
+
+Ejecutar y registrar las suites originales completas en entorno compatible.
+
+## 13. Integridad de versiones
+
+Este documento no modifica unae_4_3S_rev2.zip, UNAE_4_3S_paridad_fsm_rev3.zip ni dtos_paquete_completo.zip. Cualquier implementación debe vivir en una carpeta/versión nueva y mantener una referencia explícita a este contrato.

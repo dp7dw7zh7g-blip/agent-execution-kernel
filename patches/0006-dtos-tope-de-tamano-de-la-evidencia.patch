@@ -1,0 +1,79 @@
+--- a/src/dtos/schema.sql
++++ b/src/dtos/schema.sql
+@@ -232,7 +232,7 @@
+ -- (uq_effects_idempotency) y solo para resultados terminales: una fila
+ -- PARTIAL ahí bloquearía para siempre la fila terminal del intento que
+ -- complete el efecto con la misma idempotency_key. La evidencia (JSON
+--- canónico) se escribe en la MISMA
++-- canónico, máx. MAX_EVIDENCE_SIZE_BYTES) se escribe en la MISMA
+ -- transacción que el cambio de estado del intento.
+ -- ---------------------------------------------------------------------
+ CREATE TABLE IF NOT EXISTS effect_reconciliations (
+--- a/src/dtos/store.py
++++ b/src/dtos/store.py
+@@ -50,6 +50,23 @@
+     """
+ 
+ 
++# Tope de la evidencia serializada (JSON canónico, medido en BYTES UTF-8) que se persiste en `effects.evidence` y en `effect_reconciliations.evidence`.
++# 65536 es el valor propuesto por el usuario; no sale de mediciones. Es un límite de política: subirlo o bajarlo es decisión del operador.
++MAX_EVIDENCE_SIZE_BYTES = 65536
++
++
++class EvidenceTooLargeError(ValueError):
++    """La evidencia serializada supera MAX_EVIDENCE_SIZE_BYTES: no se persiste y no cambia ningún estado."""
++
++
++def check_evidence_size(serialized: Optional[str], *, where: str) -> None:
++    if serialized is None:
++        return
++    size = len(serialized.encode("utf-8"))
++    if size > MAX_EVIDENCE_SIZE_BYTES:
++        raise EvidenceTooLargeError(f"{where}: la evidencia ocupa {size} bytes y el máximo es {MAX_EVIDENCE_SIZE_BYTES}")
++
++
+ class BootstrapConflictError(ValueError):
+     """
+     P-063: ya existe un GENESIS_AUTHORITY_RECORD para esta instalación.
+@@ -264,6 +281,7 @@
+         status: str,
+         evidence: Optional[str] = None,
+     ) -> None:
++        check_evidence_size(evidence, where="insert_effect")
+         try:
+             with self.transaction() as conn:
+                 conn.execute(
+@@ -330,7 +348,11 @@
+         `effect_row` lleva effect_id, operation_id, intent_id, attempt_id,
+         provider, idempotency_key y, opcional, evidence (JSON canónico).
+         `reconciliation` lleva from_status, strategy y evidence (JSON canónico).
++        Una evidencia que supera MAX_EVIDENCE_SIZE_BYTES se rechaza ANTES de
++        abrir la transacción (EvidenceTooLargeError).
+         """
++        check_evidence_size(effect_row.get("evidence") if effect_row else None, where="reconcile_effect_attempt_atomic(effects)")
++        check_evidence_size(reconciliation["evidence"] if reconciliation else None, where="reconcile_effect_attempt_atomic(effect_reconciliations)")
+         try:
+             with self.transaction() as conn:
+                 cur = conn.execute(
+--- a/src/dtos/effect_repository.py
++++ b/src/dtos/effect_repository.py
+@@ -25,7 +25,7 @@
+ from .canonical import canonical_json
+ from .effect_fsm import EffectFSM
+ from .enums import EffectStatus as S
+-from .store import ConflictError, SQLiteStore
++from .store import ConflictError, SQLiteStore, check_evidence_size
+ 
+ _TERMINAL = frozenset({S.CONFIRMED, S.REJECTED})
+ 
+@@ -98,8 +98,9 @@
+         reconcile() con evidencia real (I-005 cerrado de punta a punta).
+         """
+         loaded = self.load(attempt_id)
+-        # Evidencia en forma canónica (P-064): se serializa una vez y se usa en el ledger y en el historial.
++        # Evidencia en forma canónica (P-064) y acotada: se comprueba el tamaño ANTES de tocar la FSM o el Store (EvidenceTooLargeError).
+         serialized_evidence = canonical_json(evidence)
++        check_evidence_size(serialized_evidence, where="reconcile")
+         from_status = loaded.fsm.state.value
+         loaded.fsm.reconcile(strategy=strategy, result=result_status, evidence=evidence)  # valida + exige evidencia
+ 

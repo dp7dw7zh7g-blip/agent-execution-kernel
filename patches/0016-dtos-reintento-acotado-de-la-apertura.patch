@@ -1,0 +1,82 @@
+--- a/src/dtos/store.py
++++ b/src/dtos/store.py
+@@ -33,6 +33,7 @@
+ from __future__ import annotations
+ 
+ import json
++import random
+ import sqlite3
+ import time
+ from contextlib import contextmanager
+@@ -98,6 +99,24 @@
+ # sqlite3.connect (5000 ms). Es un valor de política, no sale de mediciones: el operador puede cambiarlo con `busy_timeout_ms`.
+ DEFAULT_BUSY_TIMEOUT_MS = 10_000
+ 
++# D-67 (parche 0016): reintento acotado de la APERTURA. SQLite puede devolver «database is locked» SIN esperar el busy_timeout cuando esperar
++# podría causar un bloqueo mutuo (lo documenta SQLite). Medido en Windows 10 (g0.8 r17): con 8 procesos abriendo a la vez una base nueva, uno
++# falló a los 4 ms (la apertura tardaba de 4 a 10 s por proceso porque el esquema son ~60 sentencias en autocommit con un fsync cada una).
++# Pausas crecientes con jitter para que procesos idénticos no choquen otra vez al unísono. Valores de política, no salen de mediciones.
++OPEN_RETRY_FIRST_S = 0.01
++OPEN_RETRY_MAX_S = 0.25
++
++
++def _is_lock_error(exc: BaseException) -> bool:
++    """True si `exc` es un bloqueo temporal de SQLite (SQLITE_BUSY o SQLITE_LOCKED, con o sin código extendido). Sin código (Python < 3.11 o
++    errores construidos a mano) se decide por el texto, igual que las pruebas existentes."""
++    if not isinstance(exc, sqlite3.OperationalError):
++        return False
++    code = getattr(exc, "sqlite_errorcode", None)
++    if isinstance(code, int):
++        return (code & 0xFF) in (5, 6)
++    return "locked" in str(exc).lower()
++
+ 
+ class SQLiteStore:
+     """Persistencia de DTOS sobre un archivo SQLite compartido por varios procesos.
+@@ -109,6 +128,8 @@
+       - Toda escritura pasa por `transaction()` (BEGIN IMMEDIATE): los escritores se serializan en el bloqueo de escritura y nunca hay una
+         promoción lectura->escritura que pueda fallar sin reintento. Excepción: la creación del esquema (`executescript`), que son
+         sentencias idempotentes (IF NOT EXISTS) y reintentan por el busy_timeout; las migraciones de columnas sí van en transacción.
++      - La APERTURA (PRAGMAs + esquema) se reintenta ante un bloqueo temporal hasta agotar `busy_timeout_ms` en total (D-67): SQLite a veces
++        devuelve BUSY sin esperar. Con `busy_timeout_ms=0` no se reintenta. Los errores que no son de bloqueo no se reintentan.
+     El timeout NO elimina los bloqueos: si otro proceso mantiene el bloqueo de escritura más de `busy_timeout_ms`, la operación lanza
+     sqlite3.OperationalError (no se reintenta aquí; la transacción no deja nada escrito)."""
+ 
+@@ -119,12 +140,35 @@
+         self.busy_timeout_ms = busy_timeout_ms
+         self._conn = sqlite3.connect(self.db_path, timeout=busy_timeout_ms / 1000, isolation_level=None)  # autocommit off, control manual
+         try:
+-            self._configure_connection()
+-            self._init_schema()
++            self._open_with_retry()
+         except BaseException:
+             self._conn.close()
+             raise
+ 
++    def _open_with_retry(self) -> None:
++        """D-67: configura la conexión y crea/migra el esquema; ante un bloqueo temporal repite TODO el paso (es idempotente) con pausas crecientes
++        hasta que se agota `busy_timeout_ms` contado desde el inicio de la apertura. Pasado el plazo se relanza el error original."""
++        deadline = time.monotonic() + self.busy_timeout_ms / 1000
++        delay = OPEN_RETRY_FIRST_S
++        while True:
++            try:
++                self._configure_connection()
++                self._init_schema()
++                return
++            except sqlite3.OperationalError as exc:
++                if not _is_lock_error(exc):
++                    raise
++                if self._conn.in_transaction:  # un fallo a medias no debe dejar una transacción abierta en el siguiente intento
++                    try:
++                        self._conn.execute("ROLLBACK;")
++                    except sqlite3.Error:
++                        pass
++                remaining = deadline - time.monotonic()
++                if remaining <= 0:
++                    raise
++                time.sleep(min(delay * (0.5 + random.random() / 2), remaining))
++                delay = min(delay * 2, OPEN_RETRY_MAX_S)
++
+     def _configure_connection(self) -> None:
+         """PRAGMAs de concurrencia, ANTES de tocar el esquema (así el cambio a WAL y la creación de tablas ya reintentan ante bloqueos)."""
+         self._conn.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms};")  # int validado en __init__: no hay entrada externa en la sentencia

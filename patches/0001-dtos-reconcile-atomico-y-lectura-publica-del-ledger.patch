@@ -1,0 +1,91 @@
+--- a/src/dtos/store.py
++++ b/src/dtos/store.py
+@@ -310,6 +310,56 @@
+                 )
+             return CommitResult(rows_affected=cur.rowcount, new_version=expected_version + 1)
+ 
++
++    def reconcile_effect_attempt_atomic(
++        self,
++        attempt_id: str,
++        new_status: str,
++        expected_version: int,
++        effect_row: Optional[dict] = None,
++    ) -> CommitResult:
++        """
++        Transición del intento (optimistic concurrency) y, si es terminal,
++        fila del ledger `effects` en UNA sola transacción: o quedan las dos
++        o no queda ninguna. `effect_row` lleva effect_id, operation_id,
++        intent_id, attempt_id, provider e idempotency_key.
++        """
++        try:
++            with self.transaction() as conn:
++                cur = conn.execute(
++                    """UPDATE effect_attempts SET status = ?, version = version + 1
++                       WHERE attempt_id = ? AND version = ?""",
++                    (new_status, attempt_id, expected_version),
++                )
++                if cur.rowcount != 1:
++                    raise ConflictError(
++                        f"reconcile_effect_attempt_atomic: expected_version="
++                        f"{expected_version} no coincide (o attempt_id no existe) para "
++                        f"{attempt_id}. rows_affected={cur.rowcount}."
++                    )
++                if effect_row is not None:
++                    conn.execute(
++                        """INSERT INTO effects
++                           (effect_id, operation_id, intent_id, attempt_id,
++                            provider, idempotency_key, status)
++                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
++                        (effect_row["effect_id"], effect_row["operation_id"], effect_row["intent_id"],
++                         effect_row["attempt_id"], effect_row["provider"], effect_row["idempotency_key"], new_status),
++                    )
++                return CommitResult(rows_affected=cur.rowcount, new_version=expected_version + 1)
++        except sqlite3.IntegrityError as e:
++            raise ConflictError(
++                f"reconcile_effect_attempt_atomic: ya existe un efecto con provider="
++                f"{effect_row['provider']!r} idempotency_key={effect_row['idempotency_key']!r} "
++                f"(misma key = misma operación); no se resolvió el intento."
++            ) from e
++
++    def get_effects_by_attempt(self, attempt_id: str) -> list[dict]:
++        """Lectura pública (solo lectura) del ledger append-only `effects` para un intento."""
++        cur = self._conn.execute("SELECT * FROM effects WHERE attempt_id = ?", (attempt_id,))
++        cols = [d[0] for d in cur.description]
++        return [dict(zip(cols, row)) for row in cur.fetchall()]
++
+     def get_effect_attempt(self, attempt_id: str) -> Optional[dict]:
+         cur = self._conn.execute(
+             "SELECT attempt_id, intent_id, provider, idempotency_key, status, version "
+--- a/src/dtos/effect_repository.py
++++ b/src/dtos/effect_repository.py
+@@ -98,17 +98,18 @@
+         loaded = self.load(attempt_id)
+         loaded.fsm.reconcile(strategy=strategy, result=result_status, evidence=evidence)  # valida + exige evidencia
+ 
+-        result = self._store.commit_effect_attempt_transition(attempt_id, loaded.fsm.state.value, loaded.version)
+-
++        effect_row = None
+         if loaded.fsm.state in _TERMINAL:
+-            self._store.insert_effect(
+-                effect_id=str(uuid.uuid4()),
+-                operation_id=operation_id,
+-                intent_id=attempt_id,  # simplificado: en este esquema attempt_id referencia el intent
+-                attempt_id=attempt_id,
+-                provider=provider,
+-                idempotency_key=idempotency_key,
+-                status=loaded.fsm.state.value,
+-            )
++            effect_row = {
++                "effect_id": str(uuid.uuid4()),
++                "operation_id": operation_id,
++                "intent_id": attempt_id,  # simplificado: en este esquema attempt_id referencia el intent
++                "attempt_id": attempt_id,
++                "provider": provider,
++                "idempotency_key": idempotency_key,
++            }
++
++        # Una sola transacción: estado del intento + fila del ledger (antes eran dos).
++        result = self._store.reconcile_effect_attempt_atomic(attempt_id, loaded.fsm.state.value, loaded.version, effect_row)
+ 
+         return LoadedAttempt(fsm=loaded.fsm, version=result.new_version, operation_id=operation_id)

@@ -1,0 +1,14 @@
+{
+  "providers": {
+    "proveedor-a": {
+      "connect_timeout_s": 2.0,
+      "read_timeout_s": 5.0,
+      "total_timeout_s": 7.0
+    },
+    "proveedor-b": {
+      "connect_timeout_s": 5.0,
+      "read_timeout_s": 15.0,
+      "total_timeout_s": 20.0
+    }
+  }
+}

@@ -1,0 +1,143 @@
+--- a/src/dtos/schema.sql
++++ b/src/dtos/schema.sql
+@@ -64,6 +64,9 @@
+     scope           TEXT NOT NULL,
+     effective_from  TEXT NOT NULL,
+     hash            TEXT NOT NULL,
++    -- Parche 0008 (D-51): texto JSON canónico de la política; NULL = política sin contenido (las filas anteriores al parche).
++    -- Si no es NULL, `hash` == SHA-256 de este texto en UTF-8 (lo verifica PolicyRecord, no SQLite).
++    content         TEXT,
+     PRIMARY KEY (policy_id, version)
+ );
+ 
+--- a/src/dtos/registries.py
++++ b/src/dtos/registries.py
+@@ -15,9 +15,12 @@
+ 
+ from __future__ import annotations
+ 
++import hashlib
++import json
+ from dataclasses import dataclass
+ from typing import Optional
+ 
++from .canonical import canonical_json
+ from .enums import (
+     CognitiveCycleState,
+     EffectStatus,
+@@ -25,7 +28,7 @@
+     ProjectionState,
+     ReasoningResultStatus,
+ )
+-from .validation import require_nonempty_str, require_nonnegative_int
++from .validation import ContractValidationError, require_nonempty_str, require_nonnegative_int
+ 
+ 
+ @dataclass(frozen=True)
+@@ -101,15 +104,42 @@
+             raise TypeError("resources debe ser dict")
+ 
+ 
++class PolicyContentError(ContractValidationError):
++    """El contenido de una política no es JSON canónico válido o su hash no coincide (parche 0008, D-51)."""
++
++
++def policy_content_hash(content: str) -> str:
++    """SHA-256 (hex) de `canonical_json(json.loads(content))` en UTF-8, exigiendo que `content` YA sea ese texto canónico.
++
++    `content` es el texto JSON canónico, no un objeto: así el texto guardado en la columna `policies.content` son exactamente
++    los bytes hasheados. Se rechaza cualquier texto que no sea canónico (espacios, claves desordenadas, NaN, claves duplicadas),
++    porque dos textos distintos con el mismo significado producirían hashes distintos."""
++    if not isinstance(content, str) or not content:
++        raise PolicyContentError("content: debe ser un texto JSON canónico no vacío")
++    try:
++        canonical = canonical_json(json.loads(content))
++        if canonical != content:
++            raise PolicyContentError("content: no está en forma canónica (use canonical_json del objeto)")
++        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
++    except PolicyContentError:
++        raise
++    except (ValueError, TypeError, RecursionError) as e:  # JSON inválido, NaN/Infinity, no serializable, UTF-8 inválido
++        raise PolicyContentError(f"content: JSON no válido para forma canónica ({type(e).__name__}: {e})") from e
++
++
+ @dataclass(frozen=True)
+ class PolicyRecord:
+-    """REG-004 Policies."""
++    """REG-004 Policies.
++
++    `content` (parche 0008) es opcional: None = política sin contenido (el caso de las filas anteriores al parche, que solo guardan
++    el hash). Si se da, debe ser el texto JSON canónico y `hash` debe ser exactamente `policy_content_hash(content)`."""
+ 
+     policy_id: str
+     version: str
+     scope: str
+     effective_from: str  # ISO 8601, validado como string no vacío aquí
+     hash: str
++    content: Optional[str] = None
+ 
+     def __post_init__(self) -> None:
+         for f, v in (
+@@ -120,6 +150,12 @@
+             ("hash", self.hash),
+         ):
+             require_nonempty_str(v, f)
++        if self.content is not None:
++            expected = policy_content_hash(self.content)
++            if self.hash != expected:
++                raise PolicyContentError(
++                    f"hash: no coincide con el SHA-256 del contenido canónico (esperado {expected}, recibido {self.hash})"
++                )
+ 
+ 
+ @dataclass(frozen=True)
+--- a/src/dtos/store.py
++++ b/src/dtos/store.py
+@@ -40,7 +40,7 @@
+ from typing import Iterator, Optional
+ 
+ from .canonical import canonical_json, content_hash
+-from .registries import ArtifactRecord
++from .registries import ArtifactRecord, PolicyRecord
+ 
+ 
+ class ConflictError(ValueError):
+@@ -107,6 +107,9 @@
+         # Migración: bases creadas antes de que `effects` llevara `evidence` (CREATE TABLE IF NOT EXISTS no altera tablas existentes).
+         if "evidence" not in {row[1] for row in self._conn.execute("PRAGMA table_info(effects)")}:
+             self._conn.execute("ALTER TABLE effects ADD COLUMN evidence TEXT")
++        # Migración (parche 0008): bases creadas antes de que `policies` llevara `content`; las filas anteriores quedan con content NULL.
++        if "content" not in {row[1] for row in self._conn.execute("PRAGMA table_info(policies)")}:
++            self._conn.execute("ALTER TABLE policies ADD COLUMN content TEXT")
+ 
+     @contextmanager
+     def transaction(self) -> Iterator[sqlite3.Connection]:
+@@ -267,6 +270,28 @@
+             raise AppendOnlyViolationError(str(e)) from e
+ 
+     # -----------------------------------------------------------------
++    # POLICIES (REG-004) — parche 0008: contenido canónico verificado por hash
++    # -----------------------------------------------------------------
++
++    def insert_policy(self, record: PolicyRecord) -> None:
++        """Inserta una política. La coherencia hash/content ya la garantiza PolicyRecord al construirse. Una (policy_id, version)
++        repetida lanza sqlite3.IntegrityError (clave primaria), igual que insert_artifact."""
++        with self.transaction() as conn:
++            conn.execute(
++                "INSERT INTO policies (policy_id, version, scope, effective_from, hash, content) VALUES (?, ?, ?, ?, ?, ?)",
++                (record.policy_id, record.version, record.scope, record.effective_from, record.hash, record.content),
++            )
++
++    def get_policy(self, policy_id: str, version: str) -> Optional[PolicyRecord]:
++        """Lee una política. Reconstruye el PolicyRecord, así que una fila con content y hash incoherentes (alterada fuera de este
++        módulo) lanza PolicyContentError en lugar de devolverse como válida."""
++        row = self._conn.execute(
++            "SELECT policy_id, version, scope, effective_from, hash, content FROM policies WHERE policy_id = ? AND version = ?",
++            (policy_id, version),
++        ).fetchone()
++        return None if row is None else PolicyRecord(*row)
++
++    # -----------------------------------------------------------------
+     # EFFECTS — idempotencia real vía UNIQUE(provider, idempotency_key)
+     # -----------------------------------------------------------------
+ 

@@ -1,0 +1,163 @@
+--- a/src/dtos/store.py
++++ b/src/dtos/store.py
+@@ -586,6 +586,35 @@
+         La verificación de la cadena (AuditLog.verify) trabaja sobre esto; no valida nada por sí misma."""
+         return [tuple(r) for r in self._conn.execute("SELECT seq, entry_hash, prev_hash, payload FROM audit_log ORDER BY seq ASC").fetchall()]
+ 
++    AUDIT_BATCH_DEFAULT = 1000
++    AUDIT_BATCH_MAX = 100_000
++
++    def iter_audit_chain(self, *, batch_size: int = AUDIT_BATCH_DEFAULT) -> Iterator[list[tuple]]:
++        """D-71: lectura pública (solo lectura) de la cadena de auditoría POR LOTES, en orden de `seq`: cada elemento es una lista de hasta `batch_size`
++        tuplas (seq, entry_hash, prev_hash, payload_texto), las mismas que `read_audit_chain()`. Paginación por clave (`seq > último seq leído`), no por
++        OFFSET: cada lote cuesta lo mismo aunque la cadena sea enorme y la memoria es O(batch_size), no O(n). Cada lote es una consulta completa y su
++        cursor se cierra antes de ceder el control: entre lotes NO queda abierta ninguna lectura (no se retiene el checkpoint de WAL) y el llamador puede
++        tardar lo que quiera. Consecuencia: no es una instantánea; una entrada añadida mientras se itera aparece al final, como cualquier otra, y una fila
++        borrada a mano en un tramo ya leído no se ve (es el mismo límite de D-64: la cadena no protege frente a quien escribe en el archivo).
++        `batch_size` debe ser un entero entre 1 y `AUDIT_BATCH_MAX` (no bool)."""
++        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or not (1 <= batch_size <= self.AUDIT_BATCH_MAX):
++            raise ValueError(f"batch_size: debe ser un entero entre 1 y {self.AUDIT_BATCH_MAX}, recibido {batch_size!r}")  # al llamar, no al primer next()
++        return self._audit_batches(batch_size)
++
++    def _audit_batches(self, batch_size: int) -> Iterator[list[tuple]]:
++        after = -(2 ** 63)  # menor que cualquier seq posible: el primer lote lee desde el principio, incluso con un seq <= 0 escrito a mano
++        while True:
++            rows = [tuple(r) for r in self._conn.execute(
++                "SELECT seq, entry_hash, prev_hash, payload FROM audit_log WHERE seq > ? ORDER BY seq ASC LIMIT ?", (after, batch_size)).fetchall()]
++            if not rows:
++                return
++            yield rows
++            after = rows[-1][0]
++
++    def count_audit_entries(self) -> int:
++        """D-71: lectura pública: número de filas de `audit_log` (sin cargarlas)."""
++        return self._conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
++
+     def get_last_audit_hash(self) -> Optional[str]:
+         """Lectura pública: `entry_hash` de la última entrada de la cadena de auditoría; None si la cadena está vacía."""
+         row = self._conn.execute("SELECT entry_hash FROM audit_log ORDER BY seq DESC LIMIT 1").fetchone()
+--- a/src/dtos/audit.py
++++ b/src/dtos/audit.py
+@@ -71,7 +71,7 @@
+             )
+             return entry_hash
+ 
+-    def verify(self) -> AuditVerificationResult:
++    def verify(self, *, batch_size: int = SQLiteStore.AUDIT_BATCH_DEFAULT) -> AuditVerificationResult:
+         """
+         Recorre toda la cadena en orden y para cada entrada recalcula
+         entry_hash = content_hash({prev_hash, payload}) a partir del
+@@ -87,61 +87,63 @@
+         DE LA GARANTÍA en el docstring del módulo: no detecta una cadena
+         reescrita con los hashes recalculados ni el borrado de las
+         últimas entradas.
+-        """
+-        rows = self._store.read_audit_chain()
+-
+-        if not rows:
+-            return AuditVerificationResult(status=AuditIntegrityState.VALID, total_entries=0)
+ 
++        D-71: la cadena se lee por lotes de `batch_size` filas (`SQLiteStore.iter_audit_chain`), de modo que la memoria es O(batch_size) y no O(n).
++        El resultado es el mismo que con la lectura completa: `total_entries` es el total de filas de la tabla también cuando se detecta un fallo
++        (en ese caso se cuenta con `count_audit_entries`, sin cargarlas); si la cadena es VALID, es el número de filas verificadas.
++        """
++        total = 0
+         expected_seq = 1  # AUTOINCREMENT empieza en 1; sin esto, borrar la cabeza se vería como FORKED y no como TRUNCATED
+         running_hash = GENESIS_HASH
+ 
+-        for seq, entry_hash, prev_hash, payload_text in rows:
+-            if seq != expected_seq:
+-                return AuditVerificationResult(
+-                    status=AuditIntegrityState.TRUNCATED,
+-                    total_entries=len(rows),
+-                    first_bad_seq=expected_seq,
+-                    detail=f"hueco en seq: se esperaba {expected_seq}, se encontró {seq} "
+-                    f"(una fila fue eliminada directamente, evadiendo el trigger append-only)",
+-                )
+-
+-            if prev_hash != running_hash:
+-                return AuditVerificationResult(
+-                    status=AuditIntegrityState.FORKED,
+-                    total_entries=len(rows),
+-                    first_bad_seq=seq,
+-                    detail=f"prev_hash de seq={seq} no coincide con el entry_hash real de la "
+-                    f"entrada anterior (la cadena fue reescrita o reordenada)",
+-                )
+-
+-            try:
+-                payload = json.loads(payload_text)
+-                recomputed = content_hash({"prev_hash": prev_hash, "payload": payload})
+-            except (TypeError, ValueError, RecursionError) as e:
+-                # D-65: no solo un texto que no es JSON: también JSON que `json.loads` acepta y la forma canónica rechaza (NaN, Infinity,
+-                # un surrogate aislado -> UnicodeEncodeError, que es un ValueError) o anidado hasta agotar la pila (RecursionError).
+-                # Una fila que no se puede recalcular es una fila alterada: se informa, no se propaga.
+-                return AuditVerificationResult(
+-                    status=AuditIntegrityState.CORRUPTED,
+-                    total_entries=len(rows),
+-                    first_bad_seq=seq,
+-                    detail=f"payload de seq={seq} no es un JSON canonicalizable "
+-                    f"({type(e).__name__}); el payload fue modificado directamente en el archivo",
+-                )
+-            if recomputed != entry_hash:
+-                return AuditVerificationResult(
+-                    status=AuditIntegrityState.CORRUPTED,
+-                    total_entries=len(rows),
+-                    first_bad_seq=seq,
+-                    detail=f"entry_hash de seq={seq} no coincide con el recálculo sobre el "
+-                    f"payload almacenado (el payload fue modificado directamente en el archivo)",
+-                )
+-
+-            running_hash = entry_hash
+-            expected_seq += 1
++        for batch in self._store.iter_audit_chain(batch_size=batch_size):
++            for seq, entry_hash, prev_hash, payload_text in batch:
++                if seq != expected_seq:
++                    return AuditVerificationResult(
++                        status=AuditIntegrityState.TRUNCATED,
++                        total_entries=self._store.count_audit_entries(),
++                        first_bad_seq=expected_seq,
++                        detail=f"hueco en seq: se esperaba {expected_seq}, se encontró {seq} "
++                        f"(una fila fue eliminada directamente, evadiendo el trigger append-only)",
++                    )
++
++                if prev_hash != running_hash:
++                    return AuditVerificationResult(
++                        status=AuditIntegrityState.FORKED,
++                        total_entries=self._store.count_audit_entries(),
++                        first_bad_seq=seq,
++                        detail=f"prev_hash de seq={seq} no coincide con el entry_hash real de la "
++                        f"entrada anterior (la cadena fue reescrita o reordenada)",
++                    )
++
++                try:
++                    payload = json.loads(payload_text)
++                    recomputed = content_hash({"prev_hash": prev_hash, "payload": payload})
++                except (TypeError, ValueError, RecursionError) as e:
++                    # D-65: no solo un texto que no es JSON: también JSON que `json.loads` acepta y la forma canónica rechaza (NaN, Infinity,
++                    # un surrogate aislado -> UnicodeEncodeError, que es un ValueError) o anidado hasta agotar la pila (RecursionError).
++                    # Una fila que no se puede recalcular es una fila alterada: se informa, no se propaga.
++                    return AuditVerificationResult(
++                        status=AuditIntegrityState.CORRUPTED,
++                        total_entries=self._store.count_audit_entries(),
++                        first_bad_seq=seq,
++                        detail=f"payload de seq={seq} no es un JSON canonicalizable "
++                        f"({type(e).__name__}); el payload fue modificado directamente en el archivo",
++                    )
++                if recomputed != entry_hash:
++                    return AuditVerificationResult(
++                        status=AuditIntegrityState.CORRUPTED,
++                        total_entries=self._store.count_audit_entries(),
++                        first_bad_seq=seq,
++                        detail=f"entry_hash de seq={seq} no coincide con el recálculo sobre el "
++                        f"payload almacenado (el payload fue modificado directamente en el archivo)",
++                    )
++
++                running_hash = entry_hash
++                expected_seq += 1
++                total += 1
+ 
+-        return AuditVerificationResult(status=AuditIntegrityState.VALID, total_entries=len(rows))
++        return AuditVerificationResult(status=AuditIntegrityState.VALID, total_entries=total)
+ 
+     def last_hash(self) -> str:
+         last = self._store.get_last_audit_hash()

@@ -1,0 +1,397 @@
+--- a/src/dtos/canonical.py
++++ b/src/dtos/canonical.py
+@@ -37,6 +37,21 @@
+     return obj
+ 
+ 
++def _require_str_keys(obj: Any) -> None:
++    """D-68: `json.dumps` convierte en silencio las claves no-str (1 -> "1", True -> "true"), de modo que {1: "a"} y {"1": "a"} daban el mismo
++    texto y el mismo hash. Se rechazan (ValueError) en vez de colapsarlas. Recorrido iterativo: no añade profundidad de recursión."""
++    stack = [obj]
++    while stack:
++        o = stack.pop()
++        if isinstance(o, dict):
++            for k, v in o.items():
++                if not isinstance(k, str):
++                    raise ValueError(f"canonical_json: las claves de objeto deben ser str (llegó {type(k).__name__}: {k!r})")
++                stack.append(v)
++        elif isinstance(o, (list, tuple)):
++            stack.extend(o)
++
++
+ def canonical_json(obj: Any) -> str:
+     """
+     Serializa `obj` a JSON canónico: claves ordenadas, sin espacios,
+@@ -46,6 +61,7 @@
+     que se calculan problem_hash, input_hash, output_hash, content_hash,
+     state_hash y context_hash (P-064).
+     """
++    _require_str_keys(obj)
+     return json.dumps(
+         obj,
+         ensure_ascii=False,
+--- a/src/unae/store.py
++++ b/src/unae/store.py
+@@ -15,7 +15,23 @@
+ from typing import Any
+ 
+ 
++def _require_str_keys(value: Any) -> None:
++    """D-68: `json.dumps` convierte en silencio las claves no-str (1 -> "1", True -> "true"), de modo que {1: "a"} y {"1": "a"} daban el mismo
++    texto y el mismo hash. Se rechazan (ValueError) en vez de colapsarlas. Recorrido iterativo: no añade profundidad de recursión."""
++    stack = [value]
++    while stack:
++        o = stack.pop()
++        if isinstance(o, dict):
++            for k, v in o.items():
++                if not isinstance(k, str):
++                    raise ValueError(f"canonical_json: las claves de objeto deben ser str (llegó {type(k).__name__}: {k!r})")
++                stack.append(v)
++        elif isinstance(o, (list, tuple)):
++            stack.extend(o)
++
++
+ def canonical_json(value: Any) -> str:
++    _require_str_keys(value)
+     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+ 
+ 
+@@ -150,6 +166,17 @@
+     def __exit__(self, *exc) -> None:
+         self.close()
+ 
++    @staticmethod
++    def _rollback(c: sqlite3.Connection) -> None:
++        """D-68: ROLLBACK que nunca oculta el error original. Si el COMMIT ya se hizo (fallo posterior) o SQLite ya revirtió la transacción por
++        sí mismo, `ROLLBACK` lanza «cannot rollback - no transaction is active» y ese error tapaba al verdadero. Es el mismo criterio que
++        `dtos.store.SQLiteStore.transaction()`: solo se revierte si hay transacción y un fallo del propio ROLLBACK no se propaga."""
++        if c.in_transaction:
++            try:
++                c.execute("ROLLBACK")
++            except sqlite3.Error:
++                pass
++
+     def _commit(self, c: sqlite3.Connection, name: str) -> None:
+         if self._fault_hook:
+             self._fault_hook(f"{name}:before_commit")
+@@ -244,7 +271,7 @@
+                     c.execute("UPDATE schema_version SET version=?", (v,))
+                 self._commit(c, "_migrate")
+             except Exception:
+-                c.execute("ROLLBACK")
++                self._rollback(c)
+                 raise
+ 
+     def configure_account(self, account_id: str, compute_limit: int, time_limit_ms: int,
+@@ -278,7 +305,7 @@
+                 c.execute("INSERT INTO ownership VALUES(?,?,?)", (task_id, 1, owner_id))
+                 self._commit(c, "create_task")
+             except Exception:
+-                c.execute("ROLLBACK")
++                self._rollback(c)
+                 raise
+ 
+     def acquire_authority(self, task_id: str, owner_id: str) -> int:
+@@ -296,7 +323,7 @@
+                 self._commit(c, "acquire_authority")
+                 return token
+             except Exception:
+-                c.execute("ROLLBACK")
++                self._rollback(c)
+                 raise
+ 
+     def _release_reservation_counters(self, c: sqlite3.Connection, reservation_id: str) -> None:
+@@ -348,13 +375,13 @@
+                 owner = c.execute("SELECT fencing_token FROM ownership WHERE task_id=?", (row["task_id"],)).fetchone() if row else None
+                 if (not row or row["status"] != Status.RESERVED.value or not owner
+                         or owner[0] != fencing_token or row["fencing_token"] != fencing_token):
+-                    c.execute("ROLLBACK")
++                    self._rollback(c)
+                     return False
+                 self._cancel_reserved(c, operation_id, row["reservation_id"], now)
+                 self._commit(c, "release_reservation")
+                 return True
+             except Exception:
+-                c.execute("ROLLBACK")
++                self._rollback(c)
+                 raise
+ 
+     def expire_reservations(self, max_age_s: float, now: float | None = None) -> int:
+@@ -372,7 +399,7 @@
+                 self._commit(c, "expire_reservations")
+                 return len(rows)
+             except Exception:
+-                c.execute("ROLLBACK")
++                self._rollback(c)
+                 raise
+ 
+     def get_operation(self, operation_id: str) -> dict[str, Any] | None:
+@@ -451,8 +478,7 @@
+                     claimed.append({**event, "payload": payload, "attempts": attempts})
+                 self._commit(c, "claim_events")
+             except Exception:
+-                if c.in_transaction:  # D-65: si el COMMIT ya se hizo (fallo posterior) no hay nada que revertir ni se oculta el error real
+-                    c.execute("ROLLBACK")
++                self._rollback(c)   # D-65: si el COMMIT ya se hizo (fallo posterior) no hay nada que revertir ni se oculta el error real
+                 raise
+         return claimed
+ 
+@@ -470,8 +496,7 @@
+                 self._commit(c, "renew_claim")
+                 return n == 1
+             except Exception:
+-                if c.in_transaction:
+-                    c.execute("ROLLBACK")
++                self._rollback(c)
+                 raise
+ 
+     def dead_events(self, limit: int = 100) -> list[dict[str, Any]]:
+@@ -492,7 +517,7 @@
+                 self._commit(c, "mark_event_sent")
+                 return n == 1
+             except Exception:
+-                c.execute("ROLLBACK")
++                self._rollback(c)
+                 raise
+ 
+     def mark_event_failed(self, event_id: str, max_attempts: int = 5, worker_id: str | None = None) -> str | None:
+@@ -503,7 +528,7 @@
+                 row = c.execute("SELECT attempts FROM outbox WHERE event_id=? AND status='PENDING' AND (? IS NULL OR claimed_by=?)",
+                                 (event_id, worker_id, worker_id)).fetchone()
+                 if row is None:
+-                    c.execute("ROLLBACK")
++                    self._rollback(c)
+                     return None
+                 attempts = row[0] + 1
+                 status = "DEAD" if attempts >= max_attempts else "PENDING"
+@@ -511,7 +536,7 @@
+                 self._commit(c, "mark_event_failed")
+                 return status
+             except Exception:
+-                c.execute("ROLLBACK")
++                self._rollback(c)
+                 raise
+ 
+     def release_events(self, event_ids: Iterable[str], worker_id: str) -> int:
+@@ -532,7 +557,7 @@
+                 self._commit(c, "release_events")
+                 return n
+             except Exception:
+-                c.execute("ROLLBACK")
++                self._rollback(c)
+                 raise
+ 
+     def dispatch_outbox(self, sender, limit: int = 100, max_attempts: int = 5,
+@@ -583,14 +608,14 @@
+             c.execute("BEGIN IMMEDIATE")
+             try:
+                 if c.execute("SELECT 1 FROM consumer_inbox WHERE consumer_id=? AND event_id=?", (consumer_id, event_id)).fetchone():
+-                    c.execute("ROLLBACK")
++                    self._rollback(c)
+                     return False
+                 handler(c, event_id)
+                 c.execute("INSERT INTO consumer_inbox VALUES(?,?,?)", (consumer_id, event_id, time.time()))
+                 self._commit(c, "consume_once")
+                 return True
+             except Exception:
+-                c.execute("ROLLBACK")
++                self._rollback(c)
+                 raise
+ 
+     def verify_integrity(self) -> list[str]:
+@@ -661,7 +686,7 @@
+                 row = c.execute("SELECT task_id,reservation_id,status FROM execution_journal WHERE operation_id=?", (operation_id,)).fetchone()
+                 owner = c.execute("SELECT fencing_token FROM ownership WHERE task_id=?", (row["task_id"],)).fetchone() if row else None
+                 if not row or row["status"] != Status.UNKNOWN.value or not owner or owner[0] != fencing_token:
+-                    c.execute("ROLLBACK")
++                    self._rollback(c)
+                     return False
+                 c.execute("UPDATE execution_journal SET status=?,fencing_token=?,updated_at=? WHERE operation_id=?",
+                           (Status.RECONCILING.value, fencing_token, now, operation_id))
+@@ -669,7 +694,7 @@
+                 self._commit(c, "begin_reconciliation")
+                 return True
+             except Exception:
+-                c.execute("ROLLBACK")
++                self._rollback(c)
+                 raise
+ 
+     def reserve_and_register(self, *, task_id: str, operation_id: str, reservation_id: str,
+@@ -703,24 +728,24 @@
+                 old = c.execute("SELECT request_fingerprint,status FROM execution_journal WHERE idempotency_key=?", (idempotency_key,)).fetchone()
+                 if old:
+                     if old["request_fingerprint"] not in (req_fp, legacy_fp):
+-                        c.execute("ROLLBACK")
++                        self._rollback(c)
+                         return "KEY_CONFLICT"
+                     if old["status"] == Status.CANCELLED.value:       # la solicitud ya no existe: usar otra clave y otro operation_id
+-                        c.execute("ROLLBACK")
++                        self._rollback(c)
+                         return "CANCELLED"
+                     owner = c.execute("SELECT fencing_token FROM ownership WHERE task_id=?", (task_id,)).fetchone()
+                     if not owner or owner[0] != fencing_token:         # quien reintenta ya no tiene la autoridad
+-                        c.execute("ROLLBACK")
++                        self._rollback(c)
+                         return "STALE_AUTHORITY"
+                     self._commit(c, "reserve_and_register")
+                     return "ALREADY_RESERVED"
+                 if c.execute("SELECT 1 FROM execution_journal WHERE operation_id=? OR reservation_id=?", (operation_id, reservation_id)).fetchone():
+-                    c.execute("ROLLBACK")
++                    self._rollback(c)
+                     return "OPERATION_CONFLICT"
+                 owner = c.execute("SELECT fencing_token FROM ownership WHERE task_id=?", (task_id,)).fetchone()
+                 state = c.execute("SELECT 1 FROM task_state WHERE task_id=?", (task_id,)).fetchone()
+                 if not owner or not state or owner[0] != fencing_token:
+-                    c.execute("ROLLBACK")
++                    self._rollback(c)
+                     return "STALE_AUTHORITY"
+                 for aid in accounts:
+                     a = c.execute("SELECT * FROM budget_accounts WHERE account_id=?", (aid,)).fetchone()
+@@ -731,7 +756,7 @@
+                           a["active_memory_bytes"] + memory_bytes <= a["memory_limit_bytes"] and
+                           a["active_count"] + 1 <= a["max_concurrency"])
+                     if not ok:
+-                        c.execute("ROLLBACK")
++                        self._rollback(c)
+                         return "REJECTED_BUDGET"
+                 c.execute("INSERT INTO execution_journal(operation_id,task_id,reservation_id,idempotency_key,request_fingerprint,fencing_token,status,provider_operation_id,recovery_count,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                           (operation_id, task_id, reservation_id, idempotency_key, req_fp, fencing_token,
+@@ -746,7 +771,7 @@
+                 self._commit(c, "reserve_and_register")
+                 return "RESERVED"
+             except Exception:
+-                c.execute("ROLLBACK")
++                self._rollback(c)
+                 raise
+ 
+     def mark_running(self, operation_id: str, fencing_token: int, provider_operation_id: str | None = None,
+@@ -758,11 +783,11 @@
+             try:
+                 row = c.execute("SELECT task_id,status,fencing_token FROM execution_journal WHERE operation_id=?", (operation_id,)).fetchone()
+                 if not row or row["status"] != Status.RESERVED.value or row["fencing_token"] != fencing_token:
+-                    c.execute("ROLLBACK")
++                    self._rollback(c)
+                     return False
+                 owner = c.execute("SELECT fencing_token FROM ownership WHERE task_id=?", (row["task_id"],)).fetchone()
+                 if not owner or owner[0] != fencing_token:
+-                    c.execute("ROLLBACK")
++                    self._rollback(c)
+                     return False
+                 now = time.time()
+                 c.execute("UPDATE execution_journal SET status=?,provider_operation_id=?,provider_id=?,updated_at=? WHERE operation_id=?",
+@@ -771,7 +796,7 @@
+                 self._commit(c, "mark_running")
+                 return True
+             except Exception:
+-                c.execute("ROLLBACK")
++                self._rollback(c)
+                 raise
+ 
+     def recover_interrupted(self) -> int:
+@@ -788,7 +813,7 @@
+                 self._commit(c, "recover_interrupted")
+                 return len(rows)
+             except Exception:
+-                c.execute("ROLLBACK")
++                self._rollback(c)
+                 raise
+ 
+     def _verify_receipt(self, provider_id: str, task_id: str, signature: str, receipt_id: str, operation_id: str, reservation_id: str,
+@@ -837,23 +862,23 @@
+             try:
+                 existing = c.execute("SELECT fingerprint FROM receipts WHERE receipt_id=?", (receipt_id,)).fetchone()
+                 if existing:
+-                    c.execute("ROLLBACK")
++                    self._rollback(c)
+                     return "ALREADY_RECORDED" if existing[0] == fp else "RECEIPT_CONFLICT"
+                 op = c.execute("SELECT reservation_id,status,provider_operation_id,provider_id,task_id FROM execution_journal WHERE operation_id=?", (operation_id,)).fetchone()
+                 if not op or op["reservation_id"] != reservation_id or op["status"] not in ("RUNNING", "UNKNOWN", "RECONCILING"):
+-                    c.execute("ROLLBACK")
++                    self._rollback(c)
+                     return "INVALID_OPERATION"
+                 if signature is None and op["provider_id"] is not None:      # operación ligada a un proveedor: exige firma
+-                    c.execute("ROLLBACK")
++                    self._rollback(c)
+                     return "UNSIGNED_REJECTED"
+                 if signature is not None and (op["provider_id"] != provider_id or op["task_id"] != task_id):  # proveedor o tarea ajenos
+-                    c.execute("ROLLBACK")
++                    self._rollback(c)
+                     return "INVALID_RECEIPT"
+                 # If execution was registered with a provider operation ID, the receipt
+                 # must carry the same ID. Omitting it is not equivalent to a match.
+                 expected_provider_id = op["provider_operation_id"]
+                 if expected_provider_id is not None and provider_operation_id != expected_provider_id:
+-                    c.execute("ROLLBACK")
++                    self._rollback(c)
+                     return "INVALID_RECEIPT"
+                 c.execute("INSERT INTO receipts(receipt_id,operation_id,reservation_id,fingerprint,outcome,actual_compute,actual_time_ms,"
+                           "peak_memory_bytes,provider_operation_id,received_at,provider_id,signature) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+@@ -869,7 +894,7 @@
+                 self._commit(c, "record_receipt")
+                 return "RECORDED"
+             except Exception:
+-                c.execute("ROLLBACK")
++                self._rollback(c)
+                 raise
+ 
+     def coordinated_commit(self, request: CommitRequest) -> CommitStatus:
+@@ -890,15 +915,15 @@
+             try:
+                 old = c.execute("SELECT fingerprint FROM commit_log WHERE commit_id=?", (request.commit_id,)).fetchone()
+                 if old:
+-                    c.execute("ROLLBACK")
++                    self._rollback(c)
+                     return CommitStatus.ALREADY_COMMITTED if old[0] == commit_fp else CommitStatus.KEY_CONFLICT
+                 owner = c.execute("SELECT fencing_token FROM ownership WHERE task_id=?", (request.task_id,)).fetchone()
+                 if not owner or owner[0] != request.fencing_token:
+-                    c.execute("ROLLBACK")
++                    self._rollback(c)
+                     return CommitStatus.STALE_AUTHORITY
+                 state = c.execute("SELECT version FROM task_state WHERE task_id=?", (request.task_id,)).fetchone()
+                 if not state or state[0] != request.expected_version:
+-                    c.execute("ROLLBACK")
++                    self._rollback(c)
+                     return CommitStatus.VERSION_CONFLICT
+                 op = c.execute("SELECT * FROM execution_journal WHERE operation_id=?", (request.operation_id,)).fetchone()
+                 reservation = c.execute("SELECT * FROM reservations WHERE reservation_id=?", (request.reservation_id,)).fetchone()
+@@ -908,13 +933,13 @@
+                     reservation["operation_id"] != request.operation_id or receipt["operation_id"] != request.operation_id or
+                     receipt["reservation_id"] != request.reservation_id or op["status"] not in ("SUCCEEDED", "FAILED") or
+                     receipt["outcome"] != op["status"]):
+-                    c.execute("ROLLBACK")
++                    self._rollback(c)
+                     return CommitStatus.INVALID_RECEIPT
+                 if reservation["status"] == Status.RECONCILED.value:
+-                    c.execute("ROLLBACK")
++                    self._rollback(c)
+                     return CommitStatus.INVALID_TRANSITION
+                 if Status.RECONCILED not in _ALLOWED.get(Status(op["status"]), set()):
+-                    c.execute("ROLLBACK")
++                    self._rollback(c)
+                     return CommitStatus.INVALID_TRANSITION
+                 allocations = c.execute("SELECT account_id FROM reservation_allocations WHERE reservation_id=? ORDER BY account_id", (request.reservation_id,)).fetchall()
+                 for allocation in allocations:
+@@ -950,7 +975,7 @@
+                 self._commit(c, "coordinated_commit")
+                 return CommitStatus.COMMITTED
+             except Exception:
+-                c.execute("ROLLBACK")
++                self._rollback(c)
+                 raise
+ 
+     def mark_unknown(self, operation_id: str) -> bool:
+@@ -960,12 +985,12 @@
+             try:
+                 row = c.execute("SELECT reservation_id,status FROM execution_journal WHERE operation_id=?", (operation_id,)).fetchone()
+                 if not row or row["status"] not in (Status.RUNNING.value, Status.RECONCILING.value):
+-                    c.execute("ROLLBACK")
++                    self._rollback(c)
+                     return False
+                 c.execute("UPDATE execution_journal SET status=?,updated_at=? WHERE operation_id=?", (Status.UNKNOWN.value, now, operation_id))
+                 c.execute("UPDATE reservations SET status=?,updated_at=? WHERE reservation_id=?", (Status.UNKNOWN.value, now, row["reservation_id"]))
+                 self._commit(c, "mark_unknown")
+                 return True
+             except Exception:
+-                c.execute("ROLLBACK")
++                self._rollback(c)
+                 raise

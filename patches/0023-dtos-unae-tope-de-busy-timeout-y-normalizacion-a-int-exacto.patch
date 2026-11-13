@@ -1,0 +1,79 @@
+--- a/src/dtos/store.py
++++ b/src/dtos/store.py
+@@ -117,6 +117,23 @@
+ # crecimiento del WAL mientras una lectura abierta (p. ej. `backup_to`) impide el checkpoint. -1 = sin límite (comportamiento nativo); 0 = recortar al mínimo.
+ DEFAULT_JOURNAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024
+ 
++# D-75 (parche 0023 / g0.8 r30): `sqlite3_busy_timeout` recibe un `int` de C (32 bits con signo). Con un valor >= 2**31 el PRAGMA se desborda y SQLite queda en 0 ms
++# (medido en SQLite 3.45.1): la validación lo dejaba pasar y el error llegaba DESPUÉS de crear el archivo. 2**31 - 1 ms son ~24,8 días; es un límite del motor, no de política.
++MAX_BUSY_TIMEOUT_MS = 2 ** 31 - 1
++
++
++def _validate_connection_policy(busy_timeout_ms, journal_size_limit_bytes) -> tuple[int, int]:
++    """Valida y NORMALIZA la política de conexión: devuelve `(busy_timeout_ms, journal_size_limit_bytes)` como `int` EXACTOS (D-75). El llamante usa los
++    valores devueltos, nunca los recibidos: una subclase de `int` puede redefinir `__format__`, `__int__` o las comparaciones, y esos valores acaban dentro de
++    una sentencia PRAGMA (no admite parámetros). `int.__int__` (sin pasar por la subclase) copia el valor numérico real; el rango se comprueba sobre esa copia."""
++    busy = None if isinstance(busy_timeout_ms, bool) or not isinstance(busy_timeout_ms, int) else int.__int__(busy_timeout_ms)
++    if busy is None or not (0 <= busy <= MAX_BUSY_TIMEOUT_MS):
++        raise ValueError(f"busy_timeout_ms: debe ser un entero entre 0 y {MAX_BUSY_TIMEOUT_MS} (milisegundos), recibido {busy_timeout_ms!r}")
++    limit = None if isinstance(journal_size_limit_bytes, bool) or not isinstance(journal_size_limit_bytes, int) else int.__int__(journal_size_limit_bytes)
++    if limit is None or not (-1 <= limit < 2 ** 63):
++        raise ValueError(f"journal_size_limit_bytes: debe ser un entero >= -1 (-1 = sin límite, 0 = recorte al mínimo), recibido {journal_size_limit_bytes!r}")
++    return busy, limit
++
+ # D-67 (parche 0016): reintento acotado de la APERTURA. SQLite puede devolver «database is locked» SIN esperar el busy_timeout cuando esperar
+ # podría causar un bloqueo mutuo (lo documenta SQLite). Medido en Windows 10 (g0.8 r17): con 8 procesos abriendo a la vez una base nueva, uno
+ # falló a los 4 ms (la apertura tardaba de 4 a 10 s por proceso porque el esquema son ~60 sentencias en autocommit con un fsync cada una).
+@@ -156,10 +173,7 @@
+ 
+     def __init__(self, db_path: str | Path, *, busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+                  journal_size_limit_bytes: int = DEFAULT_JOURNAL_SIZE_LIMIT_BYTES):
+-        if isinstance(busy_timeout_ms, bool) or not isinstance(busy_timeout_ms, int) or busy_timeout_ms < 0:
+-            raise ValueError(f"busy_timeout_ms: debe ser un entero >= 0 (milisegundos), recibido {busy_timeout_ms!r}")
+-        if isinstance(journal_size_limit_bytes, bool) or not isinstance(journal_size_limit_bytes, int) or not (-1 <= journal_size_limit_bytes < 2 ** 63):
+-            raise ValueError(f"journal_size_limit_bytes: debe ser un entero >= -1 (-1 = sin límite, 0 = recorte al mínimo), recibido {journal_size_limit_bytes!r}")
++        busy_timeout_ms, journal_size_limit_bytes = _validate_connection_policy(busy_timeout_ms, journal_size_limit_bytes)  # D-75: valores normalizados
+         self.db_path = str(db_path)
+         self.busy_timeout_ms = busy_timeout_ms
+         self.journal_size_limit_bytes = journal_size_limit_bytes
+--- a/src/unae/store.py
++++ b/src/unae/store.py
+@@ -132,13 +132,22 @@
+ # reinicia el WAL; NO acota su crecimiento mientras una lectura abierta frena el checkpoint, y es por conexión (lo aplica la conexión que escribe).
+ DEFAULT_BUSY_TIMEOUT_MS = 10_000
+ DEFAULT_JOURNAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024
++# D-75 (parche 0023 / g0.8 r30): `sqlite3_busy_timeout` recibe un `int` de C (32 bits con signo). Con un valor >= 2**31 el PRAGMA se desborda y SQLite queda en 0 ms
++# (medido en SQLite 3.45.1): la validación lo dejaba pasar y el error llegaba DESPUÉS de crear el archivo. 2**31 - 1 ms son ~24,8 días; es un límite del motor, no de política.
++MAX_BUSY_TIMEOUT_MS = 2 ** 31 - 1
+ 
+ 
+-def _validate_connection_policy(busy_timeout_ms, journal_size_limit_bytes) -> None:
+-    if isinstance(busy_timeout_ms, bool) or not isinstance(busy_timeout_ms, int) or busy_timeout_ms < 0:
+-        raise ValueError(f"busy_timeout_ms: debe ser un entero >= 0 (milisegundos), recibido {busy_timeout_ms!r}")
+-    if isinstance(journal_size_limit_bytes, bool) or not isinstance(journal_size_limit_bytes, int) or not (-1 <= journal_size_limit_bytes < 2 ** 63):
++def _validate_connection_policy(busy_timeout_ms, journal_size_limit_bytes) -> tuple[int, int]:
++    """Valida y NORMALIZA la política de conexión: devuelve `(busy_timeout_ms, journal_size_limit_bytes)` como `int` EXACTOS (D-75). El llamante usa los
++    valores devueltos, nunca los recibidos: una subclase de `int` puede redefinir `__format__`, `__int__` o las comparaciones, y esos valores acaban dentro de
++    una sentencia PRAGMA (no admite parámetros). `int.__int__` (sin pasar por la subclase) copia el valor numérico real; el rango se comprueba sobre esa copia."""
++    busy = None if isinstance(busy_timeout_ms, bool) or not isinstance(busy_timeout_ms, int) else int.__int__(busy_timeout_ms)
++    if busy is None or not (0 <= busy <= MAX_BUSY_TIMEOUT_MS):
++        raise ValueError(f"busy_timeout_ms: debe ser un entero entre 0 y {MAX_BUSY_TIMEOUT_MS} (milisegundos), recibido {busy_timeout_ms!r}")
++    limit = None if isinstance(journal_size_limit_bytes, bool) or not isinstance(journal_size_limit_bytes, int) else int.__int__(journal_size_limit_bytes)
++    if limit is None or not (-1 <= limit < 2 ** 63):
+         raise ValueError(f"journal_size_limit_bytes: debe ser un entero >= -1 (-1 = sin límite, 0 = recorte al mínimo), recibido {journal_size_limit_bytes!r}")
++    return busy, limit
+ 
+ 
+ class Store:
+@@ -155,9 +164,9 @@
+         a la base y SQLite hace checkpoint y borra el -wal en cada llamada (~30 % del tiempo medido). Llamar close() o usar `with`
+         para liberarla; no usar el Store a través de fork().
+         fault_hook: solo para pruebas de caída. Se invoca como hook("<método>:before_commit") y hook("<método>:after_commit").
+-        busy_timeout_ms / journal_size_limit_bytes (D-74, solo por nombre): espera ante un bloqueo (10000 ms por defecto) y recorte del -wal tras un checkpoint
++        busy_timeout_ms / journal_size_limit_bytes (D-74, solo por nombre): espera ante un bloqueo (10000 ms por defecto; 0 a 2147483647, D-75) y recorte del -wal tras un checkpoint
+         completo (64 MiB por defecto; -1 sin límite). Se validan antes de abrir nada y se verifican leyéndolos de vuelta al abrir."""
+-        _validate_connection_policy(busy_timeout_ms, journal_size_limit_bytes)
++        busy_timeout_ms, journal_size_limit_bytes = _validate_connection_policy(busy_timeout_ms, journal_size_limit_bytes)  # D-75: valores normalizados
+         self.path = str(path)
+         self.busy_timeout_ms = busy_timeout_ms
+         self.journal_size_limit_bytes = journal_size_limit_bytes

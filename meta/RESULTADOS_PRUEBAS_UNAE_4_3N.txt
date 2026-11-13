@@ -1,0 +1,12 @@
+UNAE 4.3N — Resultados de pruebas
+Fecha de ejecución: 2026-10-21 (entorno de desarrollo)
+Comando: python -m unittest discover -s tests -v
+Resultado: 9 pruebas aprobadas, 0 fallidas.
+
+Cobertura:
+- 7 pruebas heredadas de 4.3M.
+- 1 prueba multiproceso de contención: dos solicitudes de 7 unidades frente a un límite de 10; solo una reserva es aceptada.
+- 1 prueba multiproceso de idempotencia: dos procesos envían exactamente la misma solicitud lógica; solo se crea una reserva.
+
+Alcance de la afirmación:
+Los resultados validan estos escenarios concretos en el entorno ejecutado. No certifican el sistema para producción, no cubren todos los fallos del sistema de archivos o hardware y no prueban aún outbox completo, autenticidad criptográfica de recibos, migraciones versionadas ni terminación abrupta en todos los puntos críticos.

@@ -1,0 +1,5 @@
+Pruebas UNITARIAS: test_envelope.py (AT-02, AT-03, AT-04, AT-15 + regresiones + paridad de canonicalización + conformidad JCS del sobre), test_transport_config.py (configuración de transporte) y test_retention.py (retención del inbox y revisión/purga de la cuarentena).
+Las de integración con los Stores están en tests/adapter_integration_tests/ (test_bridge.py: AT-05, 06, 07, 09, vías A/B, lecturas públicas; test_dispatch.py: AT-01, 08, 12, 13 y plazos configurados; test_reconcile.py: AT-10, 11, 14, recuperación, reconciler_id y política de REJECTED).
+Cobertura AT-01…AT-15 completa; AT-16 se cumple con `run_tests.py all`, que reporta unitarias e integración por separado.
+test_envelope.SchemaConformance requiere jsonschema (se omite si falta).
+Los parches sobre los originales están en patches/; su aplicabilidad en orden se comprueba con `run_tests.py patches` (tests/patch_tests/), y la integridad del release con `run_tests.py integrity` (tests/integrity_tests/).

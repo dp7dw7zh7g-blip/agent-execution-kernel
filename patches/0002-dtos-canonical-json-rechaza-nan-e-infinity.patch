@@ -1,0 +1,10 @@
+--- a/src/dtos/canonical.py
++++ b/src/dtos/canonical.py
+@@ -51,6 +51,7 @@
+         ensure_ascii=False,
+         sort_keys=True,
+         separators=(",", ":"),
++        allow_nan=False,  # NaN/Infinity -> ValueError (antes se serializaban; _reject_non_finite no se invocaba)
+         default=_json_default,
+     )
+ 

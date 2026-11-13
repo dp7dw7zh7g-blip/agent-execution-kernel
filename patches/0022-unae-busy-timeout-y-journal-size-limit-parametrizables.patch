@@ -1,0 +1,83 @@
+--- a/src/unae/store.py
++++ b/src/unae/store.py
+@@ -127,11 +127,26 @@
+     event_id: str
+ 
+ 
++# D-74 (parche 0022 / g0.8 r29): política de conexión parametrizable, MISMA que DTOS (D-57, D-73) pero con código propio (D-63: los almacenes no comparten código).
++# Son valores de política (no salen de mediciones). `journal_size_limit` solo recorta el `-wal` tras un checkpoint completo, cuando la siguiente escritura
++# reinicia el WAL; NO acota su crecimiento mientras una lectura abierta frena el checkpoint, y es por conexión (lo aplica la conexión que escribe).
++DEFAULT_BUSY_TIMEOUT_MS = 10_000
++DEFAULT_JOURNAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024
++
++
++def _validate_connection_policy(busy_timeout_ms, journal_size_limit_bytes) -> None:
++    if isinstance(busy_timeout_ms, bool) or not isinstance(busy_timeout_ms, int) or busy_timeout_ms < 0:
++        raise ValueError(f"busy_timeout_ms: debe ser un entero >= 0 (milisegundos), recibido {busy_timeout_ms!r}")
++    if isinstance(journal_size_limit_bytes, bool) or not isinstance(journal_size_limit_bytes, int) or not (-1 <= journal_size_limit_bytes < 2 ** 63):
++        raise ValueError(f"journal_size_limit_bytes: debe ser un entero >= -1 (-1 = sin límite, 0 = recorte al mínimo), recibido {journal_size_limit_bytes!r}")
++
++
+ class Store:
+     """Single-file SQLite reference store. External calls must never run inside its transactions."""
+ 
+     def __init__(self, path: str | Path, keyring: dict[str, bytes | tuple[bytes, ...]] | None = None,
+-                 require_signed_receipts: bool = False, fault_hook=None, synchronous: str = "FULL", keep_open: bool = True):
++                 require_signed_receipts: bool = False, fault_hook=None, synchronous: str = "FULL", keep_open: bool = True, *,
++                 busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS, journal_size_limit_bytes: int = DEFAULT_JOURNAL_SIZE_LIMIT_BYTES):
+         """keyring: provider_id -> secreto (o tupla de secretos para rotación). Los secretos viven en memoria, nunca en la base.
+         require_signed_receipts: si es True, record_receipt rechaza todo recibo sin firma válida.
+         synchronous: "FULL" (por defecto, fsync en cada commit) o "NORMAL" (más rápido; con WAL un corte de energía puede perder
+@@ -139,8 +154,13 @@
+         keep_open: mantiene una conexión ancla abierta mientras viva el Store. Sin ella, cada operación cierra la última conexión
+         a la base y SQLite hace checkpoint y borra el -wal en cada llamada (~30 % del tiempo medido). Llamar close() o usar `with`
+         para liberarla; no usar el Store a través de fork().
+-        fault_hook: solo para pruebas de caída. Se invoca como hook("<método>:before_commit") y hook("<método>:after_commit")."""
++        fault_hook: solo para pruebas de caída. Se invoca como hook("<método>:before_commit") y hook("<método>:after_commit").
++        busy_timeout_ms / journal_size_limit_bytes (D-74, solo por nombre): espera ante un bloqueo (10000 ms por defecto) y recorte del -wal tras un checkpoint
++        completo (64 MiB por defecto; -1 sin límite). Se validan antes de abrir nada y se verifican leyéndolos de vuelta al abrir."""
++        _validate_connection_policy(busy_timeout_ms, journal_size_limit_bytes)
+         self.path = str(path)
++        self.busy_timeout_ms = busy_timeout_ms
++        self.journal_size_limit_bytes = journal_size_limit_bytes
+         self._keyring = dict(keyring or {})
+         self.require_signed_receipts = require_signed_receipts
+         self._fault_hook = fault_hook
+@@ -150,8 +170,8 @@
+         self._finalizer = None
+         self._initialize()
+         if keep_open:
+-            anchor = sqlite3.connect(self.path, timeout=10, isolation_level=None, check_same_thread=False)
+-            anchor.execute("PRAGMA busy_timeout=10000")
++            anchor = sqlite3.connect(self.path, timeout=self.busy_timeout_ms / 1000, isolation_level=None, check_same_thread=False)
++            anchor.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
+             anchor.execute("SELECT 1 FROM schema_version").fetchone()      # se engancha al WAL; no se usa para nada más
+             self._finalizer = weakref.finalize(self, anchor.close)
+ 
+@@ -185,10 +205,11 @@
+             self._fault_hook(f"{name}:after_commit")
+ 
+     def connect(self) -> sqlite3.Connection:
+-        conn = sqlite3.connect(self.path, timeout=10, isolation_level=None)
++        conn = sqlite3.connect(self.path, timeout=self.busy_timeout_ms / 1000, isolation_level=None)
+         conn.row_factory = sqlite3.Row
+         conn.execute("PRAGMA foreign_keys=ON")
+-        conn.execute("PRAGMA busy_timeout=10000")
++        conn.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")  # int validado en __init__: no hay entrada externa en la sentencia
++        conn.execute(f"PRAGMA journal_size_limit={self.journal_size_limit_bytes}")  # D-74
+         conn.execute(f"PRAGMA synchronous={self._synchronous}")
+         return conn
+ 
+@@ -200,6 +221,12 @@
+                     f"journal_mode: se pidió WAL y SQLite devolvió {mode!r} para {self.path!r} (¿sistema de archivos de red, sin soporte de memoria "
+                     f"compartida o base en memoria?). UNAE exige WAL: sus operaciones abren una conexión por llamada y dependen de que lectores y "
+                     f"escritor no se bloqueen.")
++            effective = c.execute("PRAGMA busy_timeout").fetchone()[0]
++            if effective != self.busy_timeout_ms:
++                raise RuntimeError(f"busy_timeout: pedido {self.busy_timeout_ms} ms y SQLite quedó en {effective} ms")
++            limit = c.execute("PRAGMA journal_size_limit").fetchone()[0]
++            if limit != self.journal_size_limit_bytes:
++                raise RuntimeError(f"journal_size_limit: pedido {self.journal_size_limit_bytes} bytes y SQLite quedó en {limit}")
+             c.executescript("""
+             CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
+             INSERT INTO schema_version(version) SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM schema_version);

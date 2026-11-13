@@ -1,0 +1,175 @@
+--- a/src/dtos/store.py
++++ b/src/dtos/store.py
+@@ -544,7 +544,10 @@
+ 
+     def get_pending_outbox(self, limit: int = 100) -> list[tuple]:
+         """Lectura pública (solo lectura) del outbox: tuplas (outbox_id, event_type, payload_texto) de los eventos con published = 0,
+-        en orden de `outbox_id`, hasta `limit`. No reclama ni marca nada."""
++        en orden de `outbox_id`, hasta `limit`. No reclama ni marca nada. `limit` debe ser un entero >= 0 (no bool): SQLite trata un LIMIT
++        negativo como «sin tope» y rechaza un no entero con un `datatype mismatch` poco claro, así que se valida aquí (ValueError)."""
++        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
++            raise ValueError(f"limit: debe ser un entero >= 0, recibido {limit!r}")
+         return [tuple(r) for r in self._conn.execute(
+             "SELECT outbox_id, event_type, payload FROM outbox WHERE published = 0 ORDER BY outbox_id ASC LIMIT ?", (limit,)).fetchall()]
+ 
+--- a/src/dtos/audit.py
++++ b/src/dtos/audit.py
+@@ -3,12 +3,19 @@
+ ========
+ Hash chain sobre la tabla `audit_log` (sección AUDIT INTEGRITY del
+ Registro Maestro). Los triggers de schema.sql ya impiden UPDATE/DELETE
+-por el camino normal (P-065) — esto cubre un caso más duro: alguien con
+-acceso directo al archivo .db (fuera de este proceso, ej. editando bytes
+-o usando otra herramienta que ignore los triggers) modifica una fila.
+-`verify()` debe poder detectarlo igual, porque la integridad no depende
+-de que el atacante respete los triggers, depende de que el hash de cada
+-entrada sea una función determinista de (prev_hash, payload).
++por el camino normal (P-065) — esto cubre un caso más duro: una fila
++modificada o eliminada directamente en el archivo .db (corrupción de E/S,
++un error lógico, una edición manual que ignora los triggers).
++`verify()` lo detecta porque el hash de cada entrada es una función
++determinista de (prev_hash, payload).
++
++LÍMITE DE LA GARANTÍA (D-64): el hash NO lleva clave ni hay un ancla fuera
++del archivo. El modelo de amenaza asume que el sistema de archivos local es
++de confianza. Por tanto la cadena NO protege frente a quien tenga acceso de
++escritura al .db y reescriba la cadena recalculando los hashes siguientes
++(`verify()` devolvería VALID), ni detecta que se hayan borrado las ÚLTIMAS
++entradas. Si el modelo de amenaza cambia, hace falta un HMAC con clave
++externa o un ancla periódica (seq, último hash) fuera de la base.
+ 
+ GENESIS_HASH es el prev_hash de la primera entrada — un valor fijo y
+ conocido, nunca "null" ni "vacío", para que la primera entrada también
+@@ -72,15 +79,20 @@
+         guardado, alguien modificó esa fila directamente (CORRUPTED). Si
+         el prev_hash guardado en la fila no coincide con el entry_hash
+         real de la fila anterior, la cadena fue reescrita/reordenada
+-        (FORKED). Un hueco en `seq` indica que una fila fue eliminada
+-        directamente en el archivo, evadiendo el trigger (TRUNCATED).
++        (FORKED). Un hueco en `seq`, o una cadena que no empieza en
++        seq=1, indica que una fila fue eliminada directamente en el
++        archivo, evadiendo el trigger (TRUNCATED). Un payload que no es
++        JSON válido se informa como CORRUPTED (no lanza). Ver el LÍMITE
++        DE LA GARANTÍA en el docstring del módulo: no detecta una cadena
++        reescrita con los hashes recalculados ni el borrado de las
++        últimas entradas.
+         """
+         rows = self._store.read_audit_chain()
+ 
+         if not rows:
+             return AuditVerificationResult(status=AuditIntegrityState.VALID, total_entries=0)
+ 
+-        expected_seq = rows[0][0]
++        expected_seq = 1  # AUTOINCREMENT empieza en 1; sin esto, borrar la cabeza se vería como FORKED y no como TRUNCATED
+         running_hash = GENESIS_HASH
+ 
+         for seq, entry_hash, prev_hash, payload_text in rows:
+@@ -102,7 +114,16 @@
+                     f"entrada anterior (la cadena fue reescrita o reordenada)",
+                 )
+ 
+-            payload = json.loads(payload_text)
++            try:
++                payload = json.loads(payload_text)
++            except ValueError:
++                return AuditVerificationResult(
++                    status=AuditIntegrityState.CORRUPTED,
++                    total_entries=len(rows),
++                    first_bad_seq=seq,
++                    detail=f"payload de seq={seq} no es JSON válido "
++                    f"(el payload fue modificado directamente en el archivo)",
++                )
+             recomputed = content_hash({"prev_hash": prev_hash, "payload": payload})
+             if recomputed != entry_hash:
+                 return AuditVerificationResult(
+--- a/src/dtos/inbox_outbox.py
++++ b/src/dtos/inbox_outbox.py
+@@ -35,10 +35,17 @@
+ from __future__ import annotations
+ 
+ import json
++import os
+ import sqlite3
++from contextlib import contextmanager
+ from dataclasses import dataclass
+ from enum import Enum
+-from typing import Callable, Optional
++from typing import Callable, Iterator, Optional
++
++try:
++    import fcntl  # POSIX. Sin él no hay exclusión mutua entre procesos y publish_pending falla en lugar de degradarse en silencio.
++except ImportError:  # pragma: no cover - plataformas sin fcntl
++    fcntl = None  # type: ignore[assignment]
+ 
+ from .canonical import canonical_json
+ from .store import SQLiteStore
+@@ -60,12 +67,40 @@
+     published_count: int
+     failed_count: int
+     failures: tuple  # tuple de (outbox_id, error_message)
++    skipped: bool = False  # True: otro proceso ya está publicando (D-64); esta corrida no hizo nada
+ 
+ 
+ class OutboxPublisher:
+     def __init__(self, store: SQLiteStore):
+         self._store = store
+ 
++    @contextmanager
++    def _exclusive_publisher(self) -> Iterator[bool]:
++        """Exclusión mutua entre PROCESOS (D-64): `flock` sobre `<db>.publish.lock`, fuera de cualquier transacción SQLite (P-016).
++        Sin ella, dos publicadores leen las mismas filas pendientes y envían cada evento dos veces. Entrega True si esta corrida tiene
++        el bloqueo y False si otro proceso ya lo tiene (no espera). El SO lo libera solo si el proceso muere. Una base en memoria no se
++        comparte entre procesos y no lo necesita."""
++        db_path = self._store.db_path
++        if db_path in (":memory:", ""):
++            yield True
++            return
++        if fcntl is None:
++            raise RuntimeError("publish_pending exige exclusión mutua entre procesos (fcntl.flock) y esta plataforma no la ofrece")
++        fd = os.open(f"{db_path}.publish.lock", os.O_CREAT | os.O_RDWR, 0o600)
++        try:
++            try:
++                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
++                acquired = True
++            except BlockingIOError:
++                acquired = False
++            try:
++                yield acquired
++            finally:
++                if acquired:
++                    fcntl.flock(fd, fcntl.LOCK_UN)
++        finally:
++            os.close(fd)
++
+     def publish_pending(
+         self, sender_fn: Callable[[str, dict], None], limit: int = 100
+     ) -> PublishResult:
+@@ -78,17 +113,26 @@
+         evento pendiente de nuevo -> se reenvía en la próxima corrida
+         -> el consumidor lo ve como redelivery y lo deduplica por su
+         cuenta (esto es exactamente el "at-least-once" del documento).
++
++        D-64: solo un proceso publica a la vez (`_exclusive_publisher`); si otro ya lo hace, devuelve `PublishResult(0, 0, (), skipped=True)`
++        sin leer ni enviar nada. Un payload que no es JSON se informa en `failures` y NO impide enviar los eventos siguientes.
+         """
++        with self._exclusive_publisher() as acquired:
++            if not acquired:
++                return PublishResult(published_count=0, failed_count=0, failures=(), skipped=True)
++            return self._publish_locked(sender_fn, limit)
++
++    def _publish_locked(self, sender_fn: Callable[[str, dict], None], limit: int) -> PublishResult:
+         rows = self._store.get_pending_outbox(limit)
+ 
+         published = 0
+         failures = []
+ 
+         for outbox_id, event_type, payload_text in rows:
+-            payload = json.loads(payload_text)
+             try:
++                payload = json.loads(payload_text)
+                 sender_fn(event_type, payload)
+-            except Exception as e:  # noqa: BLE001 - el envío es de terceros, cualquier fallo cuenta
++            except Exception as e:  # noqa: BLE001 - el envío es de terceros (y el payload puede estar corrupto): cualquier fallo cuenta
+                 failures.append((outbox_id, str(e)))
+                 continue  # no se marca published; queda pendiente para la próxima corrida
+ 
