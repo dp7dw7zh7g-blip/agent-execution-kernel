@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+# Bases SQLite generadas al ejecutar pruebas o usar el kernel
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store

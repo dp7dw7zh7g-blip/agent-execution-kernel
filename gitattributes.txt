@@ -1,0 +1,6 @@
+# Finales de línea LF en todo el árbol: el manifiesto SHA-256 (meta/SHA256SUMS_v1_1_1.txt) y los parches
+# (patches/*.patch) dependen de bytes exactos. En Windows, core.autocrlf=true convertiría a CRLF al clonar.
+* text=auto eol=lf
+*.docx binary
+*.pdf binary
+*.zip binary
