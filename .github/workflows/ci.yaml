@@ -1,0 +1,50 @@
+# CI del kernel (g0.8 r35, D-81). Corre la suite COMPLETA, incluido el barrido SIGKILL en Linux, sin --fast.
+# No forma parte del manifiesto (que cubre src, config, schemas y tests). Escrito sin poder ejecutarlo en GitHub: la primera corrida es la verificación.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"   # lunes: detecta deriva de dependencias aunque no haya commits
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux · Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]   # el código exige >= 3.11
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: jsonschema (para SchemaConformance)
+        run: python -m pip install jsonschema
+      - name: Suite completa (estricta, con test_crash y la serie de parches)
+        run: python run_tests.py all --strict
+
+  windows:
+    name: Windows · Python 3.12
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: jsonschema
+        run: python -m pip install jsonschema
+      - name: GNU patch (viene con Git for Windows, no está en el PATH)
+        shell: bash
+        run: echo "C:\Program Files\Git\usr\bin" >> "$GITHUB_PATH"
+      - name: "Suite completa (test_crash se omite solo porque Windows no tiene SIGKILL)"
+        run: python run_tests.py all --strict

@@ -1,0 +1,50 @@
+# Estabilidad de test_event_claimed_by_another_worker_is_not_sent_twice (g0.8 r37, D-83).
+# Solo manual (Actions -> Estabilidad -> Run workflow). No forma parte del manifiesto ni del CI normal.
+# Repite la prueba N veces, cada una en un proceso nuevo, en Windows y, como control, en Linux.
+# En r20 fallaba 5 de 20 veces en Windows; r21 la cambió a reloj simulado y nunca se midió la estabilidad allí.
+name: Estabilidad
+
+on:
+  workflow_dispatch:
+    inputs:
+      repeticiones:
+        description: "Veces que se repite la prueba"
+        required: true
+        default: "20"
+
+permissions:
+  contents: read
+
+jobs:
+  repetir:
+    name: ${{ matrix.os }} - ${{ inputs.repeticiones }} repeticiones
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Repetir la prueba
+        shell: python
+        working-directory: tests/unae_tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}/src
+          N: ${{ inputs.repeticiones }}
+        run: |
+          import os, subprocess, sys
+          n = int(os.environ["N"])
+          t = "test_outbox.OutboxHardeningTests.test_event_claimed_by_another_worker_is_not_sent_twice"
+          fallos = 0
+          for i in range(1, n + 1):
+              r = subprocess.run([sys.executable, "-m", "unittest", t], capture_output=True, text=True)
+              if r.returncode != 0:
+                  fallos += 1
+                  print(f"--- repeticion {i}: FALLO ---")
+                  print(r.stderr[-1500:])
+          print(f"RESULTADO: {n - fallos}/{n} OK, {fallos} fallos")
+          sys.exit(1 if fallos else 0)
